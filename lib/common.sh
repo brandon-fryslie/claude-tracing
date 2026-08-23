@@ -27,8 +27,24 @@ CT_JAEGER_OTLP_PORT=14317       # jaeger <- collector (traces only)
 CT_JAEGER_UI_PORT=16686         # jaeger UI + query API
 CT_JAEGER_HEALTH_PORT=13134     # jaeger readiness
 CT_JAEGER_TELEMETRY_PORT=18888  # jaeger's own internal metrics
+CT_CLICKHOUSE_HTTP_PORT=8123    # clickhouse SQL over HTTP -- what `ct sql` talks to
+CT_CLICKHOUSE_NATIVE_PORT=9000  # clickhouse <- collector (native protocol)
+
+# --- the two trace sinks ----------------------------------------------------
+# Two sinks, two jobs, no dependency between them. Badger answers "show me this
+# trace" for a week; ClickHouse answers "sum tokens by month" for a year. Either
+# can be lost without taking the other with it.
+CT_CLICKHOUSE_DATA_DIR="$CT_VAR_DIR/clickhouse"
+CT_CLICKHOUSE_DATABASE=claude
+CT_CLICKHOUSE_TABLE=spans
 
 # How long spans survive on disk before badger expires them.
+#
+# ClickHouse's own retention is not here, and deliberately: it is a TTL clause
+# inside the CREATE TABLE in config/clickhouse.yaml, and ClickHouse's config
+# substitutes whole values, never substrings of a query. Rather than let this
+# file hold a year that the DDL could silently disagree with, the DDL states it
+# once and this comment says where to look.
 CT_TRACE_TTL=168h
 
 export CT_ROOT CT_VAR_DIR CT_BIN_DIR CT_RUN_DIR CT_LOG_DIR CT_CONFIG_DIR
@@ -36,24 +52,54 @@ export CT_OTLP_GRPC_PORT CT_OTLP_HTTP_PORT CT_COLLECTOR_HEALTH_PORT
 export CT_COLLECTOR_TELEMETRY_PORT CT_CLAUDE_METRICS_PORT
 export CT_JAEGER_OTLP_PORT CT_JAEGER_UI_PORT CT_JAEGER_HEALTH_PORT
 export CT_JAEGER_TELEMETRY_PORT CT_TRACE_TTL
+export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
+export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE
 
 # --- pinned tool releases ---------------------------------------------------
 CT_JAEGER_VERSION=2.20.0
 CT_OTELCOL_VERSION=0.159.0
+# The -lts suffix is part of ClickHouse's release tag, not decoration: the
+# stable channel moves every few weeks and this store is meant to hold a year.
+CT_CLICKHOUSE_VERSION=26.3.21.7-lts
 
 # --- service table ----------------------------------------------------------
-# [LAW:one-type-per-behavior] jaeger v2 IS an OpenTelemetry Collector
-# distribution, so both services are the same type of thing: a binary that takes
-# --config and answers an HTTP readiness probe. What differs is data, not
-# behavior, so the supervisor iterates this table instead of branching per
-# service. Order is start order: the trace sink comes up before its producer.
+# [LAW:one-type-per-behavior] Every service here is the same kind of thing: a
+# process to launch, and an HTTP question whose answer means "ready". What
+# differs is data, not behavior, so the supervisor iterates this table instead
+# of branching per service.
 #
-# Fields: name|binary|config|ready-url
+# The command line is the row's tail rather than a config path, because the
+# three binaries disagree about how to be told where their config is -- jaeger
+# and otelcol take `--config X`, clickhouse takes a `server` subcommand and
+# `--config-file=X`. Holding argv as data keeps that disagreement in the table,
+# where a fourth service is a fourth row and still not a fourth code path.
+#
+# Order is start order, and it is load-bearing: ClickHouse owns the span table
+# and its readiness question is that table answering, so by the time the
+# collector starts there is something for it to insert into.
+# [LAW:no-ambient-temporal-coupling]
+#
+# Fields: name|ready-url|argv...
 ct_services() {
   cat <<EOF
-jaeger|$CT_BIN_DIR/jaeger|$CT_CONFIG_DIR/jaeger.yaml|http://127.0.0.1:$CT_JAEGER_UI_PORT/api/services
-collector|$CT_BIN_DIR/otelcol-contrib|$CT_CONFIG_DIR/collector.yaml|http://127.0.0.1:$CT_COLLECTOR_HEALTH_PORT/
+clickhouse|http://127.0.0.1:$CT_CLICKHOUSE_HTTP_PORT/?query=SELECT+count()+FROM+$CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE|$CT_BIN_DIR/clickhouse|server|--config-file=$CT_CONFIG_DIR/clickhouse.yaml
+jaeger|http://127.0.0.1:$CT_JAEGER_UI_PORT/api/services|$CT_BIN_DIR/jaeger|--config|$CT_CONFIG_DIR/jaeger.yaml
+collector|http://127.0.0.1:$CT_COLLECTOR_HEALTH_PORT/|$CT_BIN_DIR/otelcol-contrib|--config|$CT_CONFIG_DIR/collector.yaml
 EOF
+}
+
+# Applies a handler to every service row, as: handler <name> <ready-url> <argv...>
+#
+# [LAW:composability] The handler is a value crossing this boundary, which is
+# what lets up, down, and status each say what they do to a service without any
+# of them restating how the table is parsed.
+ct_for_each_service() {
+  local handler="$1" row
+  local -a field
+  while IFS= read -r row; do
+    IFS='|' read -r -a field <<<"$row"
+    "$handler" "${field[@]}"
+  done < <(ct_services)
 }
 
 # --- output -----------------------------------------------------------------
@@ -67,6 +113,30 @@ ct_die() { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 ct_pidfile() { printf '%s/%s.pid\n' "$CT_RUN_DIR" "$1"; }
 ct_logfile() { printf '%s/%s.log\n' "$CT_LOG_DIR" "$1"; }
+
+# --- waiting ----------------------------------------------------------------
+
+# Retries a condition until it holds or the deadline passes; true if it held.
+#
+# [LAW:no-ambient-temporal-coupling] Every wait in this stack is a wait for a
+# stated condition -- a port answering, a table existing, a span arriving, a
+# process gone -- and never for an elapsed interval. This is the one place that
+# turns a condition into a wait, so no caller is tempted to approximate one
+# with a sleep.
+#
+# Returning false rather than dying is what makes it reusable: what a timeout
+# means differs at every call site (a service tails its own log, a missing span
+# names the sink to check), so the caller keeps that and only the loop is shared.
+CT_POLL_INTERVAL_SECONDS=0.5
+ct_poll_until() {
+  local seconds="$1" deadline; shift
+  deadline=$(( $(date +%s) + seconds ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    "$@" && return 0
+    sleep "$CT_POLL_INTERVAL_SECONDS"
+  done
+  return 1
+}
 
 # Reports the live pid of a service, or nothing. A pidfile whose process is gone
 # is stale, not running -- callers get absence, never a dead pid.

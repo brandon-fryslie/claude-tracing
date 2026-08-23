@@ -110,7 +110,33 @@ are my tokens going" resolves to *which subagent*, not which prompt. `agent_id`,
 a table that buries them in a generic attribute map makes every expensive query an
 extraction later.
 
+**But the two attributes you need are on different spans.** Measured 2026-08-23 by running
+a traced session that spawns a subagent, because no session traced up to that point had
+spawned one and the whole subagent story was going on unverified. `subagent_type` is
+stamped on the `tool` span for the `Agent` call; `agent_id` is stamped on the
+`llm_request` spans the subagent itself makes, which hang two levels below it:
+
+```
+claude_code.tool  tool_name=Agent  subagent_type=general-purpose
+└─ claude_code.tool.execution
+   └─ claude_code.llm_request  agent_id=a09810…  llm_request.context=tool
+```
+
+They never appear on the same row, so attributing tokens to a *kind* of subagent is a
+two-hop join up the span tree, not a `GROUP BY` — and a join that gets one hop wrong
+returns a number that looks entirely reasonable. It's written once as the
+`claude.subagent_requests` view rather than left for each query to rediscover.
+
+`llm_request.context` was the useful surprise: it reads `tool` on a subagent's requests
+and `interaction` on the main agent's, which separates the two populations with no join
+at all. `parent_agent_id` is still unobserved — it presumably needs agents nested inside
+agents. The column exists and is empty.
+
 ## The architecture that follows
+
+As of 2026-08-23 this is built, not proposed: `./ct up` starts ClickHouse alongside
+Jaeger, `./ct sql` queries it, and `./ct verify` fails if a span reaches one sink and not
+the other.
 
 Jaeger already does one job well: view a single trace, seven days, badger, ~110 MB
 steady state. Nothing about that needs to change. A year of history answering
@@ -135,7 +161,11 @@ Neither is authoritative over the other.
 
 ClickHouse ships as a single static binary, so it fits how this repo already works —
 pinned under `var/bin`, a row in `ct_tool_pins()` and `ct_services()`, no Docker, nothing
-installed globally.
+installed globally. Two things about that binary were not obvious until measured: the
+only versioned macOS build is a GitHub release asset (`clickhouse-macos-aarch64`), since
+`builds.clickhouse.com` publishes macOS from master only, and it is self-extracting — it
+rewrites itself from 161 MB to 855 MB the first time it runs, so its installed hash never
+matches what was downloaded.
 
 ### One question that's harder than it looks
 
@@ -168,6 +198,9 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | Claude Code honors `OTEL_RESOURCE_ATTRIBUTES` | **Measured** — 2.1.226; attributes land as Jaeger process tags and answer a tag search |
 | One raw space discards the whole attribute set | **Measured** — controlled pair, one variable changed; see below |
 | Events pipeline volume vs its 256 MB ceiling | **Unmeasured** — nobody has counted; ticket 7 measures first |
+| `agent_id` on llm_request, `subagent_type` on the Agent tool span | **Measured** — traced session spawning a subagent, 2026-08-23 |
+| `parent_agent_id` exists at all | **Unmeasured** — never seen in this stack's data; the column is empty |
+| ClickHouse self-extracts on first run | **Measured** — 161 MB downloaded, 855 MB after one `--version` |
 
 The encoding result is worth stating on its own, because its failure mode is invisible.
 Two runs of the same prompt, one variable changed:
@@ -180,6 +213,14 @@ Two runs of the same prompt, one variable changed:
 There is no partial parse and no complaint. Since git permits commas in branch names and
 paths routinely contain spaces, percent-encoding the values isn't tidiness — it's what
 stands between one stray character and a session labelled with nothing at all.
+
+A third defect surfaced while landing ClickHouse and was fixed there rather than
+ticketed. `ct_install_tool` decided a binary was already installed by re-hashing it and
+comparing to the pin — fine for two immutable binaries, wrong for a self-extracting one.
+ClickHouse failed that check forever and re-downloaded 161 MB on every single `./ct up`,
+quietly, because a re-download looks exactly like a first install. The pin is checked once
+now, against the bytes off the network, and the result is kept in a `.verified` file
+rather than re-derived from a file the program owns.
 
 Two live defects found along the way, both recorded as tickets:
 
@@ -237,6 +278,20 @@ for k,v in sorted(by.items()):
 ```
 
 Span totals follow from the counts: `interactions + assistant_msgs + 3 × tool_calls`.
+
+On-disk size, which is the one number above that is still assumed rather than measured.
+Once there is a real month in ClickHouse, this settles the 150–400 MB/year estimate:
+
+```bash
+./ct sql "SELECT partition,
+                 sum(rows) AS rows,
+                 formatReadableSize(sum(data_compressed_bytes))   AS on_disk,
+                 formatReadableSize(sum(data_uncompressed_bytes)) AS raw,
+                 round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 1) AS ratio
+          FROM system.parts
+          WHERE database = 'claude' AND table = 'spans' AND active
+          GROUP BY partition ORDER BY partition FORMAT PrettyCompact"
+```
 
 ## Where this is tracked
 

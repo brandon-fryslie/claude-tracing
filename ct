@@ -4,10 +4,11 @@
 #
 #   ./ct up        fetch pinned binaries, start the stack, wait until it answers
 #   ./ct claude    run claude here, traced, labelled with the work it is doing
+#   ./ct sql       query a year of spans:  ./ct sql 'SELECT count() FROM claude.spans'
 #   ./ct env       print the exports that make Claude Code emit spans
-#   ./ct verify    prove end to end that a Claude span reaches Jaeger
+#   ./ct verify    prove end to end that a Claude span reaches both sinks
 #   ./ct status    what is running, and is it answering
-#   ./ct logs      tail both service logs
+#   ./ct logs      tail the service logs
 #   ./ct ui        open the Jaeger UI
 #   ./ct down      stop the stack
 
@@ -19,6 +20,12 @@ CT_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$CT_SELF_DIR/lib/labels.sh"
 
 READY_TIMEOUT_SECONDS=30
+# ClickHouse flushes and closes its parts on the way down, so it is the service
+# that sets this floor; the other two exit near-instantly.
+STOP_TIMEOUT_SECONDS=30
+# How long a span may take to cross the collector's batch window and land in a
+# sink. Claude exports every 5s and the collector batches for 2 more.
+SINK_TIMEOUT_SECONDS=30
 SELFTEST_SERVICE=claude-tracing-selftest
 
 # Claude Code's own resource service.name. cmd_env deliberately does not set
@@ -35,23 +42,28 @@ CLAUDE_SERVICE_NAME=claude-code
 # out. Hence -fs (quiet on failure) rather than -fsS.
 ct_probe() { curl -fs --max-time 2 -o /dev/null "$1"; }
 
+# One query, posted rather than URL-encoded, so a query containing anything at
+# all -- quotes, newlines, percent signs -- reaches ClickHouse as written.
+ct_clickhouse() {
+  curl -fsS --max-time 30 "http://127.0.0.1:$CT_CLICKHOUSE_HTTP_PORT/" --data-binary "$1"
+}
+
 # Blocks until the service answers its readiness URL, or dies with the tail of
 # its own log. [LAW:no-ambient-temporal-coupling] the gate is the condition we
-# actually depend on -- the query API answering -- never an elapsed sleep.
+# actually depend on -- the query API answering, the span table existing --
+# never an elapsed sleep.
 ct_await_ready() {
-  local name="$1" url="$2" deadline
-  deadline=$(( $(date +%s) + READY_TIMEOUT_SECONDS ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if ct_probe "$url"; then return 0; fi
-    sleep 0.2
-  done
+  local name="$1" url="$2"
+  ct_poll_until "$READY_TIMEOUT_SECONDS" ct_probe "$url" && return 0
   ct_warn "--- last 20 lines of $(ct_logfile "$name") ---"
   tail -n 20 "$(ct_logfile "$name")" >&2
   ct_die "$name did not become ready at $url within ${READY_TIMEOUT_SECONDS}s"
 }
 
+# Handler over a service row: name, readiness URL, then the command to run.
 ct_start_service() {
-  local name="$1" bin="$2" config="$3" ready="$4" pid
+  local name="$1" ready="$2" bin="$3" pid
+  shift 2
   pid="$(ct_pid_of "$name")"
   if [ -n "$pid" ]; then
     ct_info "$name already running (pid $pid)"
@@ -69,14 +81,16 @@ ct_start_service() {
     -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
     -u OTEL_EXPORTER_OTLP_HEADERS -u CLAUDE_CODE_ENABLE_TELEMETRY \
     OTEL_TRACES_EXPORTER=none \
-    "$bin" --config "$config" >>"$(ct_logfile "$name")" 2>&1 &
+    "$@" >>"$(ct_logfile "$name")" 2>&1 &
   printf '%s\n' "$!" > "$(ct_pidfile "$name")"
   ct_await_ready "$name" "$ready"
   ct_ok "$name ready (pid $(cat "$(ct_pidfile "$name")"))"
 }
 
+ct_process_gone() { ! kill -0 "$1" 2>/dev/null; }
+
 ct_stop_service() {
-  local name="$1" pid deadline
+  local name="$1" pid
   pid="$(ct_pid_of "$name")"
   rm -f "$(ct_pidfile "$name")"
   if [ -z "$pid" ]; then
@@ -84,50 +98,56 @@ ct_stop_service() {
     return 0
   fi
   kill "$pid"
-  deadline=$(( $(date +%s) + 10 ))
-  while kill -0 "$pid" 2>/dev/null; do
-    [ "$(date +%s)" -lt "$deadline" ] || ct_die "$name (pid $pid) ignored SIGTERM for 10s"
-    sleep 0.2
-  done
+  ct_poll_until "$STOP_TIMEOUT_SECONDS" ct_process_gone "$pid" \
+    || ct_die "$name (pid $pid) ignored SIGTERM for ${STOP_TIMEOUT_SECONDS}s"
   ct_ok "$name stopped"
+}
+
+ct_report_service() {
+  local name="$1" ready="$2" pid state
+  pid="$(ct_pid_of "$name")"
+  state="stopped"
+  if [ -n "$pid" ]; then
+    state="running (pid $pid), not answering $ready"
+    if ct_probe "$ready"; then state="ready (pid $pid)"; fi
+  fi
+  printf '%-11s %s\n' "$name" "$state"
 }
 
 # --- subcommands ------------------------------------------------------------
 
 cmd_up() {
-  mkdir -p "$CT_BIN_DIR" "$CT_RUN_DIR" "$CT_LOG_DIR" "$CT_VAR_DIR/jaeger"
+  mkdir -p "$CT_BIN_DIR" "$CT_RUN_DIR" "$CT_LOG_DIR" "$CT_VAR_DIR/jaeger" \
+           "$CT_CLICKHOUSE_DATA_DIR"
   ct_install_tools
-  local name bin config ready
-  while IFS='|' read -r name bin config ready; do
-    ct_start_service "$name" "$bin" "$config" "$ready"
-  done < <(ct_services)
+  ct_for_each_service ct_start_service
   echo
   ct_ok "Jaeger UI  http://127.0.0.1:$CT_JAEGER_UI_PORT"
-  ct_info "OTLP in   127.0.0.1:$CT_OTLP_GRPC_PORT (gRPC)  127.0.0.1:$CT_OTLP_HTTP_PORT (HTTP)"
-  ct_info "Metrics   http://127.0.0.1:$CT_CLAUDE_METRICS_PORT/metrics"
-  ct_info "Events    $CT_LOG_DIR/claude-events.jsonl"
+  ct_info "OTLP in    127.0.0.1:$CT_OTLP_GRPC_PORT (gRPC)  127.0.0.1:$CT_OTLP_HTTP_PORT (HTTP)"
+  ct_info "SQL        ./ct sql 'SELECT count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE'"
+  ct_info "Metrics    http://127.0.0.1:$CT_CLAUDE_METRICS_PORT/metrics"
+  ct_info "Events     $CT_LOG_DIR/claude-events.jsonl"
   echo
   ct_trace "Next:  cd to the repo you want to trace, then:  $CT_ROOT/ct claude"
 }
 
-cmd_down() {
-  local name rest
-  while IFS='|' read -r name rest; do
-    ct_stop_service "$name"
-  done < <(ct_services)
-}
+cmd_down()   { ct_for_each_service ct_stop_service; }
+cmd_status() { ct_for_each_service ct_report_service; }
 
-cmd_status() {
-  local name bin config ready pid state
-  while IFS='|' read -r name bin config ready; do
-    pid="$(ct_pid_of "$name")"
-    state="stopped"
-    if [ -n "$pid" ]; then
-      state="running (pid $pid), not answering $ready"
-      if ct_probe "$ready"; then state="ready (pid $pid)"; fi
-    fi
-    printf '%-10s %s\n' "$name" "$state"
-  done < <(ct_services)
+# Ad-hoc SQL against the year of spans -- the seam every analytical question
+# goes through, so nothing downstream has to learn ClickHouse's wire protocol.
+#
+# [LAW:dataflow-not-control-flow] The query is passed through untouched and the
+# answer goes to stdout in ClickHouse's default TabSeparated, so `./ct sql ... |
+# cut -f2` composes. Output shape is a value the caller supplies -- `FORMAT
+# PrettyCompact` to read, `FORMAT JSON` to parse -- rather than a mode this
+# command picks by sniffing whether stdout is a terminal. One code path, and the
+# answer does not change shape depending on who is watching.
+cmd_sql() {
+  local query="$*"
+  [ -n "$query" ] || ct_die "usage: ct sql <query>
+  e.g.  ./ct sql \"SELECT SpanType, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
+  ct_clickhouse "$query" || ct_die "ClickHouse rejected the query, or is not up. Check: ./ct status"
 }
 
 cmd_logs() {
@@ -242,18 +262,35 @@ verify_labels() {
   ct_ok "  encoding holds, and a directory with no repo drops the vcs labels"
 }
 
-jaeger_api() { curl -fsS --max-time 5 "http://127.0.0.1:$CT_JAEGER_UI_PORT/api/$1"; }
+jaeger_api()  { curl -fsS --max-time 5 "http://127.0.0.1:$CT_JAEGER_UI_PORT/api/$1"; }
+jaeger_shows() { jaeger_api "$1" | grep -q "$2"; }
 
 # Polls Jaeger until the needle shows up in the given API path, or fails.
 ct_await_in_jaeger() {
-  local path="$1" needle="$2" what="$3" hint="${4:-}" deadline
-  deadline=$(( $(date +%s) + 30 ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if jaeger_api "$path" | grep -q "$needle"; then return 0; fi
-    sleep 1
-  done
+  local path="$1" needle="$2" what="$3" hint="${4:-}"
+  ct_poll_until "$SINK_TIMEOUT_SECONDS" jaeger_shows "$path" "$needle" && return 0
   ct_die "$what never reached Jaeger.
-  Looked for '$needle' in /api/$path for 30s.
+  Looked for '$needle' in /api/$path for ${SINK_TIMEOUT_SECONDS}s.
+  ${hint:+$hint
+  }Check: ./ct status, and $CT_LOG_DIR/collector.log"
+}
+
+# True when the query returns any row at all, so the query must select rows and
+# not count them: an aggregate answers '0' to a question with no matches, which
+# is a non-empty answer meaning nothing arrived -- exactly the answer-shaped void
+# this is here to catch. [LAW:parse-dont-validate]
+clickhouse_returns_a_row() {
+  local rows
+  rows="$(ct_clickhouse "$1")" || return 1
+  [ -n "$rows" ]
+}
+
+ct_await_in_clickhouse() {
+  local query="$1" what="$2" hint="${3:-}"
+  ct_poll_until "$SINK_TIMEOUT_SECONDS" clickhouse_returns_a_row "$query" && return 0
+  ct_die "$what never reached ClickHouse.
+  This query returned no rows for ${SINK_TIMEOUT_SECONDS}s:
+$query
   ${hint:+$hint
   }Check: ./ct status, and $CT_LOG_DIR/collector.log"
 }
@@ -264,7 +301,7 @@ verify_transport() {
   span_id="$(openssl rand -hex 8)"
   now_ns=$(( $(date +%s) * 1000000000 ))
 
-  ct_info "stage 2/3: synthetic span -> collector -> jaeger"
+  ct_info "stage 2/3: synthetic span -> collector -> both sinks"
   curl -fsS --max-time 5 -o /dev/null \
     -X POST "http://127.0.0.1:$CT_OTLP_HTTP_PORT/v1/traces" \
     -H 'Content-Type: application/json' \
@@ -273,6 +310,18 @@ verify_transport() {
 
   ct_await_in_jaeger "traces?service=$SELFTEST_SERVICE&lookback=1h" "$trace_id" "the synthetic span"
   ct_ok "  transport works: $trace_id is queryable in Jaeger"
+
+  # The same span, asked for in SQL. The fan-out means one sink can fail while
+  # the other passes, which is the whole point of having two -- and the reason
+  # this is a separate assertion rather than a second guess at the first one.
+  ct_await_in_clickhouse \
+    "SELECT SpanId FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE TraceId = '$trace_id'" \
+    "the synthetic span" \
+    "Jaeger has it, so the collector received it and the ClickHouse exporter is
+  what did not deliver. The likeliest cause is the exporter's insert no longer
+  matching the table in config/clickhouse.yaml -- a collector upgrade that adds
+  a column does exactly this. The error is in the collector log."
+  ct_ok "  and in ClickHouse: SELECT ... WHERE TraceId = '$trace_id'"
 }
 
 # Jaeger's tag search takes a JSON object of tag/value pairs, ANDed together.
@@ -288,7 +337,7 @@ verify_claude() {
   nonce="ct-selftest-$(openssl rand -hex 4)"
   labels="$(ct_work_labels)"
 
-  ct_info "stage 3/3: real claude session -> collector -> jaeger"
+  ct_info "stage 3/3: real claude session -> collector -> both sinks"
 
   # Run through the launcher rather than around it, so this stage covers the
   # path a real session takes -- labels included -- instead of a shortcut that
@@ -320,8 +369,34 @@ verify_claude() {
   One malformed entry makes Claude Code drop the whole set silently."
 
   ct_ok "  work-unit labels are searchable: $labels"
+
+  # [LAW:verifiable-goals] A row landing in ClickHouse is not the goal; a row
+  # whose promoted columns are populated is. Those columns are extractions from
+  # an attribute map, so a key Claude Code renames does not break anything
+  # loudly -- it yields '' forever, and a column that is uniformly empty looks
+  # identical to a column for something that never happened. By the time a query
+  # returns a suspiciously round number, a year of history is already wrong.
+  # So this asserts on the values, not the row count.
+  ct_await_in_clickhouse \
+    "SELECT SessionId, Model, ContextTokens
+       FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
+      WHERE SpanType = 'llm_request'
+        AND SessionId != '' AND Model != '' AND Repository != '' AND ContextTokens > 0
+        AND SessionId IN (
+              SELECT SessionId FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
+               WHERE SpanType = 'interaction' AND SpanAttributes['user_prompt'] LIKE '%$nonce%')
+      LIMIT 1" \
+    "the probe session's promoted columns" \
+    "The session's spans may well be in ClickHouse -- what failed is that
+  SpanType, SessionId, Model, Repository or ContextTokens came back empty on
+  them. Compare the attribute keys on a live span against the MATERIALIZED
+  expressions in config/clickhouse.yaml:
+    ./ct sql \"SELECT SpanAttributes FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE ORDER BY Timestamp DESC LIMIT 1 FORMAT Vertical\""
+
+  ct_ok "  spans are grouped by span type, session, model, repo and context size"
   echo
   ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
+  ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
 }
 
 cmd_verify() {
@@ -347,6 +422,7 @@ case "${1:-}" in
   ui)     cmd_ui ;;
   env)    cmd_env ;;
   verify) cmd_verify ;;
+  sql)    shift; cmd_sql "$@" ;;
   claude) shift; cmd_claude "$@" ;;
   *)      usage; exit 1 ;;
 esac

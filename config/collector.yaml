@@ -27,6 +27,21 @@ exporters:
     tls:
       insecure: true
 
+  # The second trace sink: a year of spans, answering SQL. Traces are Alpha in
+  # this exporter, which is an argument for keeping badger as the viewing sink
+  # of record -- as the traces pipeline below does -- rather than an argument
+  # against landing the history here.
+  #
+  # create_schema is off because ClickHouse creates the table itself at startup
+  # (config/clickhouse.yaml), where the partitioning, sort key and one-year TTL
+  # can be stated. Left on, this exporter would create a table with its own
+  # defaults, and every one of those clauses is a migration afterwards.
+  clickhouse:
+    endpoint: tcp://127.0.0.1:${env:CT_CLICKHOUSE_NATIVE_PORT}?dial_timeout=10s
+    database: ${env:CT_CLICKHOUSE_DATABASE}
+    traces_table_name: ${env:CT_CLICKHOUSE_TABLE}
+    create_schema: false
+
   # Claude's counters (tokens, cost, tool decisions) as a scrape surface. Curl it
   # directly, or point a Prometheus at it later -- no extra process needed today.
   prometheus:
@@ -49,10 +64,12 @@ extensions:
 service:
   extensions: [health_check]
   pipelines:
+    # One stream, two sinks, and they are independent: if ClickHouse is down the
+    # collector retries into it while Jaeger keeps receiving, and the reverse.
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlp_grpc/jaeger]
+      exporters: [otlp_grpc/jaeger, clickhouse]
     metrics:
       receivers: [otlp]
       processors: [batch]

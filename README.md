@@ -1,10 +1,11 @@
 # claude-tracing
 
-Runs a local OpenTelemetry Collector and Jaeger, and points Claude Code at them, so
-you can open a session in a trace viewer and see where the time and tokens went.
+Runs a local OpenTelemetry Collector, Jaeger, and ClickHouse, and points Claude Code at
+them. Open one session in a trace viewer and see where its time went; ask SQL questions
+about a year of them.
 
-Both are native binaries. There is no Docker, no VM, and nothing to install globally —
-`./ct up` downloads two pinned executables into `var/bin` and starts them.
+All three are native binaries. There is no Docker, no VM, and nothing to install
+globally — `./ct up` downloads three pinned executables into `var/bin` and starts them.
 
 ## Quickstart
 
@@ -12,6 +13,9 @@ Both are native binaries. There is no Docker, no VM, and nothing to install glob
 ./ct up                  # fetch binaries, start the stack, wait until it answers
 ./ct claude              # work normally, traced and labelled
 open http://127.0.0.1:16686
+
+./ct sql "SELECT Model, sum(OutputTokens) FROM claude.spans
+          GROUP BY 1 FORMAT PrettyCompact"
 ```
 
 `./ct claude` runs Claude in whatever directory you are standing in, so from another
@@ -25,12 +29,14 @@ To prove the whole path works before you trust it:
 ./ct verify
 ```
 
-Three stages, cheapest first. It checks the label encoding without touching the network,
-sends a synthetic span through the collector and waits for it in Jaeger, then runs a real
-one-prompt session through the launcher and waits for *its* span — and for a Jaeger tag
-search on the labels that session was launched with. Every stage that talks to Jaeger
-plants a random nonce and searches for that exact string, so a pass means this run's data
-arrived, not that some older trace is still lying around.
+Three stages, cheapest first. It checks the label encoding without touching the network.
+It sends a synthetic span through the collector and waits for that span to reach both
+sinks. Then it runs a real one-prompt session through the launcher and waits for the
+session's own spans — in Jaeger, under a tag search on the labels it was launched with,
+and in ClickHouse, with the promoted columns actually populated rather than merely
+present. Every stage that talks to a sink plants a random nonce and searches for that
+exact string, so a pass means this run's data arrived, not that some older trace is still
+lying around.
 
 ## What you get
 
@@ -53,7 +59,10 @@ claude_code.interaction              3523.9ms   user_prompt="Run the bash comman
 Every span carries `session.id`, so a Jaeger tag search on one id pulls up every turn
 of a session. Subagents land in the same trace as the `Agent` call that spawned them:
 the tool span is tagged `subagent_type=general-purpose`, and the requests the subagent
-makes are tagged with its `agent_id` (plus `parent_agent_id`, once agents nest).
+makes are tagged with its `agent_id`. Those two tags are on different spans, which
+matters once you start counting tokens — see [Subagents need a join](#subagents-need-a-join-and-its-easy-to-get-wrong).
+Claude Code also documents a `parent_agent_id` for nested agents; no session traced here
+has produced one yet.
 
 The `blocked_on_user` span is the one worth knowing about: it separates the time Claude
 spent working from the time it spent waiting on you to hit approve.
@@ -105,27 +114,120 @@ two thirds of the telemetry disappears without anyone telling you. The collector
 to give each signal a real sink:
 
 ```
-claude  ──OTLP/gRPC──▶  collector :4317  ──traces──▶  jaeger :14317 ──▶ badger on disk
+claude  ──OTLP/gRPC──▶  collector :4317  ──traces──┬▶ jaeger :14317 ──▶ badger    7 days
+                                                   └▶ clickhouse :9000 ──▶ SQL    1 year
                                          ──metrics─▶  :8889/metrics (Prometheus format)
                                          ──logs────▶  var/log/claude-events.jsonl
 ```
+
+Traces go to two sinks because they answer two different questions. Badger is what
+Jaeger reads to draw one trace, and it holds a week. ClickHouse holds a year and answers
+`sum(tokens) group by month`. Neither depends on the other: if the ClickHouse path
+breaks, viewing still works, and the reverse.
+
+Jaeger 2.20 does ship its own ClickHouse backend, and this deliberately doesn't use it —
+the binary prints `WARNING: ClickHouse Storage is Experimental` on the way up, and
+there's no reason to put a working viewer behind that.
 
 | Port    | What                                                        |
 | ------- | ----------------------------------------------------------- |
 | `4317`  | Collector OTLP gRPC — the only address Claude is ever given |
 | `4318`  | Collector OTLP HTTP                                         |
 | `16686` | Jaeger UI and query API                                     |
+| `8123`  | ClickHouse over HTTP — what `./ct sql` talks to             |
 | `8889`  | Claude's metrics: cost in USD, tokens by type, session count |
+| `9000`  | ClickHouse native protocol, which the collector writes to    |
 | `14317` | Jaeger's OTLP receiver, moved aside so the collector owns 4317 |
 
-Ports, versions, and binary checksums are all defined once, in `lib/common.sh`. The two
-YAML configs read them back through OpenTelemetry's `${env:...}` expansion rather than
-restating them, so there is no second copy to drift.
+Ports, versions, and binary checksums are all defined once, in `lib/common.sh`. The three
+YAML configs read them back rather than restating them — the two collectors through
+OpenTelemetry's `${env:...}` expansion, ClickHouse through its own `@from_env` — so there
+is no second copy to drift.
 
 Jaeger v2 is itself a Collector distribution, which is why `config/jaeger.yaml` and
-`config/collector.yaml` look alike: same schema, same `--config` flag. `ct` treats both
-services as the same kind of thing — a binary that takes a config and answers a
-readiness URL — and starts them by iterating a table rather than by branching.
+`config/collector.yaml` look alike: same schema, same `--config` flag. `ct` treats all
+three services as the same kind of thing — something to launch, and an HTTP question
+whose answer means "ready" — and starts them by iterating a table rather than by
+branching. The command line is part of that table, because ClickHouse disagrees with the
+other two about how to be told where its config is.
+
+For ClickHouse that readiness question does more than it looks: it's a `SELECT` against
+the span table, not a ping. ClickHouse creates that table itself on startup, so the probe
+can't pass until the schema is really there — which is why nothing in `ct` runs
+migrations, and why the collector never starts before there's something to insert into.
+
+## Asking questions in SQL
+
+`./ct sql` runs a query against `claude.spans` and prints the answer. It passes the query
+through untouched, so the output shape is yours to pick by ending it with `FORMAT
+PrettyCompact` for reading or leaving the default tab-separated for piping.
+
+```bash
+./ct sql "SELECT toYYYYMM(Timestamp) AS month,
+                 sum(InputTokens + OutputTokens) AS billed
+          FROM claude.spans
+          WHERE SpanType = 'llm_request' AND StopReason = 'tool_use'
+          GROUP BY 1 ORDER BY 1 FORMAT PrettyCompact"
+```
+
+Every span attribute survives in the `SpanAttributes` and `ResourceAttributes` maps, so
+nothing is lost. On top of that, the attributes the interesting questions group by are
+promoted to real columns, computed once when the row is inserted:
+
+| Column | From |
+| ---------------------------------------------------------- | ----------------------------------- |
+| `SpanType` | `interaction`, `llm_request`, `tool`, `tool.execution`, `tool.blocked_on_user` |
+| `SessionId`, `InteractionSequence` | which session, and which turn within it |
+| `Model`, `ToolName`, `StopReason` | the obvious grouping keys |
+| `InputTokens`, `OutputTokens`, `CacheReadTokens`, `CacheCreationTokens` | as emitted |
+| `ContextTokens` | input + cache-read + cache-creation: the proxy for context size |
+| `AgentId`, `ParentAgentId`, `SubagentType`, `RequestContext` | subagents, below |
+| `Repository`, `Branch`, `WorkingDirectory` | the labels `./ct claude` stamps |
+
+`ContextTokens` is stored rather than computed per query on purpose. Claude Code emits no
+context-size attribute, so any answer about context size is a sum of three other fields —
+and a definition retyped in every query is a definition that eventually differs between
+two of them. It's written down once, in `config/clickhouse.yaml`.
+
+The table is partitioned by month, sorted by `(SpanType, SessionId, Timestamp)`, and
+holds a year. Those three are set at creation and are migrations afterwards, which is why
+this repo creates the table rather than letting the exporter do it — the exporter's
+defaults are daily partitions, a 30-day TTL, and a sort key led by a column that only
+ever holds `claude-code`.
+
+### Subagents need a join, and it's easy to get wrong
+
+Almost everything Claude does on your behalf happens inside a subagent, so "where did my
+tokens go" usually means *which subagent*. The awkward part is that the two attributes
+you need land on different spans:
+
+```
+claude_code.tool  tool_name=Agent  subagent_type=general-purpose   ← the type is here
+└─ claude_code.tool.execution
+   └─ claude_code.llm_request  agent_id=a09810…  ← the tokens are here
+```
+
+They never appear on the same row, so attributing tokens to a *kind* of subagent is a
+two-hop walk up the span tree. That walk is written once as a view, so no query has to
+rediscover it:
+
+```bash
+./ct sql "SELECT SubagentType, count() AS requests, sum(OutputTokens) AS out_tok
+          FROM claude.subagent_requests
+          GROUP BY 1 ORDER BY out_tok DESC FORMAT PrettyCompact"
+```
+
+When the *kind* doesn't matter, skip the join: `RequestContext` reads `tool` on a
+subagent's own requests and `interaction` on the main agent's.
+
+One question that looks easier than it is: **tokens spent on tool usage** has no
+structural answer. Tokens live on `llm_request` spans and tools live on `tool` spans, and
+they are siblings, not parent and child — nothing links a token count to a tool call. You
+can count the requests that ended in `stop_reason = 'tool_use'`, which is what it cost to
+*decide* to call a tool, or you can also count the following request, which is where the
+tool's output gets paid for. The second is where the money is: a tool returning 40 KB is
+billed on the next request, not its own. Pick deliberately and write the definition next
+to the query.
 
 ## What gets recorded
 
@@ -152,8 +254,16 @@ span event, truncated at 60 KB each. It makes traces large.
 ./ct down      # stop
 ```
 
-Traces live in badger under `var/jaeger` and expire after 7 days (`CT_TRACE_TTL` in
-`lib/common.sh`). They survive restarts. To start clean, `./ct down && rm -rf var/jaeger`.
+Every span is written to both sinks and expires on each sink's own clock. Badger keeps 7
+days under `var/jaeger` (`CT_TRACE_TTL` in `lib/common.sh`); ClickHouse keeps a year under
+`var/clickhouse` (the `TTL` clause in `config/clickhouse.yaml`, which can't be an
+`@from_env` because ClickHouse substitutes whole values, never pieces of a query). Both
+survive restarts. To start either one clean, `./ct down` and delete its directory.
+
+A year is expected to land in 150–400 MB. That estimate is reasoned rather than measured
+— about 60% of every span is the same identity block repeated verbatim, which a columnar
+store collapses to almost nothing — so check it rather than trust it once there's a real
+year in there.
 
 Everything under `var/` is disposable and gitignored — binaries, pidfiles, logs, and
 storage all come back from `./ct up`.
@@ -179,6 +289,12 @@ route. Both carry the transport and neither carries the labels.
 **A service won't start.** `./ct up` prints the last 20 lines of that service's log
 before giving up. The full logs are in `var/log/`.
 
+**Spans are in Jaeger but not in ClickHouse.** Then the collector received them and the
+ClickHouse exporter is what didn't deliver, which `./ct verify` reports as a stage-2
+failure. The likeliest cause is the exporter's `INSERT` no longer matching the table:
+a collector upgrade that adds a column does exactly this. The error is in
+`var/log/collector.log`, and the table is in `config/clickhouse.yaml`.
+
 **Spans are slow to appear.** Claude batches exports every 5 seconds and the collector
 batches for 2 more, so allow about 10 seconds after a turn ends.
 
@@ -189,5 +305,15 @@ the new value.
 
 `ct_tool_pins()` in `lib/tools.sh` pins the sha256 of each binary for darwin/arm64 only.
 On any other platform `./ct up` stops and tells you what to add rather than installing
-something unverified: download the release tarball, run `shasum -a 256` on the extracted
-binary, and add a row.
+something unverified: download the release artifact, run `shasum -a 256` on it, and add a
+row.
+
+Each row carries an `extract` field — a filter that reads the download on stdin and writes
+the binary on stdout. Jaeger and the collector ship tarballs, so theirs is `tar xzOf -
+<member>`; ClickHouse ships a bare binary, so its is `cat`. A project that publishes a zip
+is a new value in that column, not a new branch.
+
+Pin the hash of what you downloaded, not of the installed file. ClickHouse ships
+self-extracting and rewrites itself the first time it runs — 161 MB becomes 855 MB and the
+hash changes for good — so `./ct up` records what it verified in a `.verified` file beside
+the binary instead of re-hashing something the program owns.
