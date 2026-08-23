@@ -1,0 +1,229 @@
+# ClickHouse -- the year-long analytics sink, and the owner of the span table.
+#
+# Badger holds seven days and answers "show me this trace". This holds a year
+# and answers "sum tokens by month". Neither is authoritative over the other:
+# the collector's stream is the source of truth and fans out to both, so losing
+# either sink leaves the other doing its own job unchanged.
+#
+# Ports and paths come from lib/common.sh through ClickHouse's `@from_env`
+# substitution, so there is no second copy to drift. The one thing that cannot
+# come from there is the schema below -- ClickHouse substitutes whole values,
+# never substrings of a query -- so `claude.spans` is written here and read back
+# by `ct` as the service's readiness question. If the two ever disagree, ClickHouse
+# comes up, the readiness query 404s, and `./ct up` fails saying so. The
+# agreement is checked on every start rather than trusted. [LAW:single-enforcer]
+
+listen_host: 127.0.0.1
+http_port:
+  "@from_env": CT_CLICKHOUSE_HTTP_PORT
+tcp_port:
+  "@from_env": CT_CLICKHOUSE_NATIVE_PORT
+path:
+  "@from_env": CT_CLICKHOUSE_DATA_DIR
+
+# Logs go to stdout, which `ct` redirects into var/log/clickhouse.log alongside
+# the other two services, so `./ct logs` shows all three. `warning` rather than
+# `information` because ClickHouse narrates every background merge at info, and
+# a log nobody can read is a log nobody checks. Errors still speak up.
+logger:
+  level: warning
+  console: true
+
+# A single-user analytics box on a laptop that is also running everything else.
+# ClickHouse sizes its caches for a dedicated server by default -- 5 GB of mark
+# cache alone -- which is the wrong trade here.
+mark_cache_size: 268435456
+max_server_memory_usage_to_ram_ratio: 0.3
+max_concurrent_queries: 16
+
+# No system.query_log and friends: they are the largest thing this server would
+# write, and nothing in this stack reads them. Their absence is why `SHOW TABLES
+# FROM system` is short.
+
+profiles:
+  default: {}
+quotas:
+  default: {}
+users:
+  default:
+    password: ""
+    profile: default
+    quota: default
+    # Loopback only, matching listen_host. Nothing here leaves the machine.
+    networks:
+      ip: "::1"
+
+# --- the schema -------------------------------------------------------------
+# Run by ClickHouse itself before it accepts connections, which is what keeps
+# schema creation out of `ct`: there is no migration step to forget, no ordering
+# to arrange, and the readiness probe cannot pass until this has run.
+# [LAW:no-ambient-temporal-coupling]
+#
+# throw_on_error stops the server rather than logging past a broken DDL. A
+# ClickHouse that is up but has no table to insert into is the worst outcome
+# available: the collector would retry forever and the spans would be gone.
+# [LAW:no-silent-failure]
+startup_scripts:
+  throw_on_error: true
+  scripts:
+    - query: CREATE DATABASE IF NOT EXISTS claude
+
+    # Columns down to Links.Attributes are the OpenTelemetry ClickHouse
+    # exporter's insert contract, copied from the schema it generates when left
+    # to create its own table. We create it instead, because PARTITION BY, ORDER
+    # BY and TTL cannot be changed after the fact and the exporter's defaults
+    # (daily partitions, 30-day TTL, a sort key led by a column that only ever
+    # holds "claude-code") are wrong for a year of analytics.
+    #
+    # That does make this a second copy of a list the exporter owns, so it is
+    # held true the only way a copy can be: the exporter names its columns in
+    # the INSERT, `ct verify` sends a span through it every run, and a version
+    # that adds a column fails loudly there rather than quietly dropping data.
+    - query: |
+        CREATE TABLE IF NOT EXISTS claude.spans
+        (
+          Timestamp           DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+          TraceId             String CODEC(ZSTD(1)),
+          SpanId              String CODEC(ZSTD(1)),
+          ParentSpanId        String CODEC(ZSTD(1)),
+          TraceState          String CODEC(ZSTD(1)),
+          SpanName            LowCardinality(String) CODEC(ZSTD(1)),
+          SpanKind            LowCardinality(String) CODEC(ZSTD(1)),
+          ServiceName         LowCardinality(String) CODEC(ZSTD(1)),
+          ResourceAttributes  Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+          ScopeName           String CODEC(ZSTD(1)),
+          ScopeVersion        String CODEC(ZSTD(1)),
+          SpanAttributes      Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+          Duration            UInt64 CODEC(ZSTD(1)),
+          StatusCode          LowCardinality(String) CODEC(ZSTD(1)),
+          StatusMessage       String CODEC(ZSTD(1)),
+          `Events.Timestamp`  Array(DateTime64(9)) CODEC(ZSTD(1)),
+          `Events.Name`       Array(LowCardinality(String)) CODEC(ZSTD(1)),
+          `Events.Attributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
+          `Links.TraceId`     Array(String) CODEC(ZSTD(1)),
+          `Links.SpanId`      Array(String) CODEC(ZSTD(1)),
+          `Links.TraceState`  Array(String) CODEC(ZSTD(1)),
+          `Links.Attributes`  Array(Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
+
+          -- Everything below is promoted out of the attribute maps: MATERIALIZED,
+          -- so it is computed once at insert and stored as a real column that can
+          -- lead the sort key and carry an index. The maps keep the originals, so
+          -- promotion buys query ergonomics and index reach, never exclusivity --
+          -- an attribute nobody promoted is still there in SpanAttributes.
+          --
+          -- What earns a column is being a grouping key for one of the questions
+          -- this table exists to answer. Note that a key which is simply absent
+          -- extracts to '', which costs nothing in a dictionary-encoded column.
+
+          -- interaction | llm_request | tool | tool.execution | tool.blocked_on_user.
+          -- Leads the sort key because essentially every analytical query starts by
+          -- naming one of them.
+          SpanType            LowCardinality(String) MATERIALIZED SpanAttributes['span.type'],
+          SessionId           String MATERIALIZED SpanAttributes['session.id'],
+          InteractionSequence UInt32 MATERIALIZED toUInt32OrZero(SpanAttributes['interaction.sequence']),
+
+          -- Subagents, and the one thing to know about them: `agent_id` is stamped
+          -- on the subagent's own llm_request spans, while `subagent_type` is
+          -- stamped on the Agent *tool* span that spawned it. They never appear on
+          -- the same row. Attributing tokens to a subagent TYPE is therefore a walk
+          -- up the tree -- llm_request -> tool.execution -> tool -- and not a GROUP
+          -- BY. `RequestContext` is the cheap way to avoid that walk when the type
+          -- does not matter: it reads 'tool' on a subagent's requests and
+          -- 'interaction' on the main agent's.
+          --
+          -- ParentAgentId is documented by Claude Code for nested agents and has
+          -- not yet been observed in this stack's data; if the key is never sent,
+          -- this column is uniformly empty. Promoted anyway because adding it later
+          -- is a migration, and an unused empty column costs nothing.
+          AgentId             String MATERIALIZED SpanAttributes['agent_id'],
+          ParentAgentId       String MATERIALIZED SpanAttributes['parent_agent_id'],
+          SubagentType        LowCardinality(String) MATERIALIZED SpanAttributes['subagent_type'],
+          RequestContext      LowCardinality(String) MATERIALIZED SpanAttributes['llm_request.context'],
+
+          Model               LowCardinality(String) MATERIALIZED SpanAttributes['model'],
+          ToolName            LowCardinality(String) MATERIALIZED SpanAttributes['tool_name'],
+          StopReason          LowCardinality(String) MATERIALIZED SpanAttributes['stop_reason'],
+
+          InputTokens         UInt32 MATERIALIZED toUInt32OrZero(SpanAttributes['input_tokens']),
+          OutputTokens        UInt32 MATERIALIZED toUInt32OrZero(SpanAttributes['output_tokens']),
+          CacheReadTokens     UInt32 MATERIALIZED toUInt32OrZero(SpanAttributes['cache_read_tokens']),
+          CacheCreationTokens UInt32 MATERIALIZED toUInt32OrZero(SpanAttributes['cache_creation_tokens']),
+
+          -- Claude Code emits no context-size attribute, so this is the proxy:
+          -- everything the model had to read on this request. MATERIALIZED rather
+          -- than derived at query time, and that is the deliberate choice -- as a
+          -- query-time expression the definition would be retyped in every query
+          -- that touches the 400k question and would drift between them, which is
+          -- how two answers to one question start disagreeing. Stored once, it is
+          -- one definition and it can carry the skip index below.
+          -- [LAW:one-source-of-truth]
+          ContextTokens       UInt32 MATERIALIZED toUInt32OrZero(SpanAttributes['input_tokens'])
+                                                + toUInt32OrZero(SpanAttributes['cache_read_tokens'])
+                                                + toUInt32OrZero(SpanAttributes['cache_creation_tokens']),
+
+          -- Stamped by `ct claude`, not by Claude Code, and they arrive as resource
+          -- attributes rather than span attributes. Sessions started any other way
+          -- have them empty, which reads as "launched outside the launcher".
+          Repository          LowCardinality(String) MATERIALIZED ResourceAttributes['vcs.repository.name'],
+          Branch              LowCardinality(String) MATERIALIZED ResourceAttributes['vcs.ref.head.name'],
+          WorkingDirectory    String MATERIALIZED ResourceAttributes['process.working_directory'],
+
+          INDEX idx_trace_id       TraceId                        TYPE bloom_filter(0.001) GRANULARITY 1,
+          INDEX idx_res_attr_key   mapKeys(ResourceAttributes)    TYPE bloom_filter(0.01)  GRANULARITY 1,
+          INDEX idx_res_attr_value mapValues(ResourceAttributes)  TYPE bloom_filter(0.01)  GRANULARITY 1,
+          INDEX idx_span_attr_key  mapKeys(SpanAttributes)        TYPE bloom_filter(0.01)  GRANULARITY 1,
+          INDEX idx_span_attr_val  mapValues(SpanAttributes)      TYPE bloom_filter(0.01)  GRANULARITY 1,
+          INDEX idx_duration       Duration                       TYPE minmax GRANULARITY 1,
+          INDEX idx_context_tokens ContextTokens                  TYPE minmax GRANULARITY 1
+        )
+        ENGINE = MergeTree
+
+        -- Monthly, because a year is the retention target and the questions are
+        -- monthly ones ("tokens spent on tool usage in march"). The exporter's
+        -- own default is daily, which would leave 365 partitions standing in for
+        -- 12 real answers.
+        PARTITION BY toYYYYMM(Timestamp)
+
+        -- SpanType first because every analytical query names one and it prunes
+        -- hardest; SessionId next so "everything session X did" stays a seek
+        -- rather than a scan; Timestamp last to order within. ServiceName leads
+        -- the exporter's default sort key and is omitted here on purpose -- it
+        -- holds one value, so as a leading key it sorts nothing.
+        ORDER BY (SpanType, SessionId, Timestamp)
+
+        -- A year, stated rather than inherited. With ttl_only_drop_parts a whole
+        -- month is dropped at once, when its newest row passes a year old, so
+        -- real retention runs 12-13 months. That is the deliberate trade: dropping
+        -- by part is a file unlink, and the alternative is rewriting every part in
+        -- the table to evict rows a day at a time.
+        TTL toDateTime(Timestamp) + INTERVAL 1 YEAR
+        SETTINGS ttl_only_drop_parts = 1
+
+    # The one thing that cannot be a column: attributing a subagent's tokens to
+    # the KIND of subagent, because agent_id and subagent_type land on different
+    # spans. The link is the span tree -- an llm_request hangs under the
+    # tool.execution of the Agent tool call that spawned it -- so it is a two-hop
+    # walk, and a walk stated once here rather than re-derived by every question
+    # that needs it. Re-derived, it would eventually be got wrong by one hop and
+    # return a number that looks entirely reasonable. [LAW:one-source-of-truth]
+    #
+    # A plain view, so it costs no storage and cannot fall behind the table.
+    - query: |
+        CREATE VIEW IF NOT EXISTS claude.subagent_requests AS
+        SELECT
+          request.Timestamp           AS Timestamp,
+          request.SessionId           AS SessionId,
+          request.AgentId             AS AgentId,
+          agent_tool.SubagentType     AS SubagentType,
+          request.Model               AS Model,
+          request.InputTokens         AS InputTokens,
+          request.OutputTokens        AS OutputTokens,
+          request.CacheReadTokens     AS CacheReadTokens,
+          request.CacheCreationTokens AS CacheCreationTokens,
+          request.ContextTokens       AS ContextTokens,
+          request.Repository          AS Repository,
+          request.Branch              AS Branch
+        FROM claude.spans AS request
+        JOIN claude.spans AS execution  ON request.ParentSpanId   = execution.SpanId
+        JOIN claude.spans AS agent_tool ON execution.ParentSpanId = agent_tool.SpanId
+        WHERE request.SpanType = 'llm_request' AND request.RequestContext = 'tool'
