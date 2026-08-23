@@ -30,13 +30,16 @@ To prove the whole path works before you trust it:
 ```
 
 Three stages, cheapest first. It checks the label encoding without touching the network.
-It sends a synthetic span through the collector and waits for that span to reach both
-sinks. Then it runs a real one-prompt session through the launcher and waits for the
-session's own spans — in Jaeger, under a tag search on the labels it was launched with,
-and in ClickHouse, with the promoted columns actually populated rather than merely
-present. Every stage that talks to a sink plants a random nonce and searches for that
-exact string, so a pass means this run's data arrived, not that some older trace is still
-lying around.
+It sends a synthetic trace, metric and log through the collector and waits for all four
+sinks to hand them back. Then it runs a real one-prompt session through the launcher and
+waits for that session in the same four — plus a Jaeger tag search on the labels it was
+launched with, and a ClickHouse row whose promoted columns are populated rather than
+merely present.
+
+Each stage picks a session id before it emits anything and then asks every sink for that
+exact string, so a pass means this run's data arrived, not that an older trace is still
+lying around. Nothing the stack writes sits outside that check: break any one exporter
+and verify goes red naming the sink that lost the run.
 
 ## What you get
 
@@ -279,7 +282,7 @@ with no repo and no branch on them.
 **No `claude-code` service in the Jaeger dropdown.** Spans are a beta feature gated on
 `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, which `./ct env` sets. If they still don't
 arrive, your build or account may not have it — verified working on Claude Code 2.1.226.
-Run `./ct verify`: if stage 1 passes and stage 2 fails, the stack is fine and the
+Run `./ct verify`: if stages 1 and 2 pass and stage 3 fails, the stack is fine and the
 problem is on Claude's side.
 
 **Spans arrive with no repo or branch on them.** They were emitted by a `claude` that
@@ -294,6 +297,11 @@ ClickHouse exporter is what didn't deliver, which `./ct verify` reports as a sta
 failure. The likeliest cause is the exporter's `INSERT` no longer matching the table:
 a collector upgrade that adds a column does exactly this. The error is in
 `var/log/collector.log`, and the table is in `config/clickhouse.yaml`.
+
+**`:8889/metrics` answers `200` with an empty body.** Nothing has reached the Prometheus
+exporter, so it has nothing to serve — the metrics pipeline is broken, not the endpoint.
+It looks healthy to anything that only checks the status code, which is why `./ct verify`
+asks for a session id in the body instead. The error is in `var/log/collector.log`.
 
 **Spans are slow to appear.** Claude batches exports every 5 seconds and the collector
 batches for 2 more, so allow about 10 seconds after a turn ends.

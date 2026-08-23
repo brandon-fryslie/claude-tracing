@@ -6,7 +6,7 @@
 #   ./ct claude    run claude here, traced, labelled with the work it is doing
 #   ./ct sql       query a year of spans:  ./ct sql 'SELECT count() FROM claude.spans'
 #   ./ct env       print the exports that make Claude Code emit spans
-#   ./ct verify    prove end to end that a Claude span reaches both sinks
+#   ./ct verify    prove end to end that a Claude session reaches every sink
 #   ./ct status    what is running, and is it answering
 #   ./ct logs      tail the service logs
 #   ./ct ui        open the Jaeger UI
@@ -207,14 +207,18 @@ cmd_claude() {
 }
 
 # --- verification -----------------------------------------------------------
-# [LAW:verifiable-goals] "the stack is up" is not the goal; "a Claude span is
-# queryable in Jaeger, and you can tell what work it was doing" is. All three
-# stages run every time, cheapest first, each isolating one thing: the label
-# encoding, then the transport, then the thing you actually came for.
+# [LAW:verifiable-goals] "the stack is up" is not the goal; "this run's telemetry
+# is queryable in every sink the stack claims to have, and you can tell what work
+# it was doing" is. All three stages run every time, cheapest first, each
+# isolating one thing: the label encoding, then the transport, then the thing you
+# actually came for.
 #
-# Anything this stack claims to do and verify does not check will rot unnoticed
-# -- which is how an empty metrics endpoint survived a passing verify for hours.
-# A new sink or a new label belongs inside this definition of done.
+# A sink outside this definition of done has nothing holding it up, so it rots
+# and nobody is told -- which is how the metrics endpoint answered HTTP 200 with
+# an empty body for hours while verify went green. The defence is structural
+# rather than diligent: one sink table, one enforcer, and a new sink is a row in
+# it. A check bolted on beside the table would drift the same way the sinks did.
+# [LAW:single-enforcer]
 
 # [LAW:behavior-not-structure] What a value encodes to, not how it gets there --
 # a different encoder passing all of these would be just as correct.
@@ -262,17 +266,51 @@ verify_labels() {
   ct_ok "  encoding holds, and a directory with no repo drops the vcs labels"
 }
 
-jaeger_api()  { curl -fsS --max-time 5 "http://127.0.0.1:$CT_JAEGER_UI_PORT/api/$1"; }
-jaeger_shows() { jaeger_api "$1" | grep -q "$2"; }
+# --- a run, and the four places it has to land ------------------------------
+# A probe run is two values: the service its telemetry arrives under, and a
+# needle -- one string, stamped as `session.id` on everything the run emits.
+#
+# That stamp is what lets four unlike sinks be asked one question, because
+# session.id is the key all four already index on: a Jaeger tag, a promoted
+# ClickHouse column, a Prometheus label, an attribute on every event record.
+# Without it each sink would need its own notion of "this run", and four notions
+# is how the sinks drifted apart in the first place. [LAW:one-source-of-truth]
 
-# Polls Jaeger until the needle shows up in the given API path, or fails.
-ct_await_in_jaeger() {
-  local path="$1" needle="$2" what="$3" hint="${4:-}"
-  ct_poll_until "$SINK_TIMEOUT_SECONDS" jaeger_shows "$path" "$needle" && return 0
-  ct_die "$what never reached Jaeger.
-  Looked for '$needle' in /api/$path for ${SINK_TIMEOUT_SECONDS}s.
-  ${hint:+$hint
-  }Check: ./ct status, and $CT_LOG_DIR/collector.log"
+# A uuid, because `claude --session-id` takes one and Claude Code then stamps it
+# on every span, metric and event of the session -- so the needle is known before
+# the run rather than recovered from a payload afterwards. Lowercased because
+# every sink compares it exactly and macOS uuidgen answers in upper case.
+ct_uuid() { uuidgen | tr '[:upper:]' '[:lower:]'; }
+
+# True when running the given command produces output containing the needle.
+#
+# The body is captured whole rather than piped into grep, and that is the point:
+# `grep -q` closes the pipe on its first match, the producer still writing dies of
+# SIGPIPE, and under `set -o pipefail` a *found* needle comes back as a failed
+# pipeline. A check that goes red at random is a check nobody believes, so the
+# pipe is removed rather than the flake tolerated.
+ct_output_holds() {
+  local needle="$1" body
+  shift
+  body="$("$@")" || return 1
+  case "$body" in *"$needle"*) return 0 ;; esac
+  return 1
+}
+
+# A failing probe is a return value here, not an error to report -- the caller
+# polls it, and the sink enforcer is what speaks up when the polling runs out.
+# Hence -fs (quiet on failure), the same trade ct_probe makes.
+jaeger_api() { curl -fs --max-time 5 "http://127.0.0.1:$CT_JAEGER_UI_PORT/api/$1"; }
+
+# Jaeger's tag search takes a JSON object of tag/value pairs, ANDed together, and
+# matches them against a span's own attributes and its resource attributes alike
+# -- which is why one query below can name both the session (a span attribute)
+# and the work-unit labels (resource attributes).
+json_escape()   { local v="${1//\\/\\\\}"; printf '%s' "${v//\"/\\\"}"; }
+jaeger_tag_of() { printf '"%s":"%s"' "$(json_escape "$1")" "$(json_escape "$2")"; }
+jaeger_traces_tagged() {
+  local service="$1" tags="$2"
+  jaeger_api "traces?service=$service&lookback=1h&tags=$(ct_percent_encode "{$tags}")"
 }
 
 # True when the query returns any row at all, so the query must select rows and
@@ -285,88 +323,188 @@ clickhouse_returns_a_row() {
   [ -n "$rows" ]
 }
 
-ct_await_in_clickhouse() {
-  local query="$1" what="$2" hint="${3:-}"
-  ct_poll_until "$SINK_TIMEOUT_SECONDS" clickhouse_returns_a_row "$query" && return 0
-  ct_die "$what never reached ClickHouse.
-  This query returned no rows for ${SINK_TIMEOUT_SECONDS}s:
-$query
-  ${hint:+$hint
-  }Check: ./ct status, and $CT_LOG_DIR/collector.log"
+# Each of these answers one question -- is this run's data in my sink yet -- and
+# each takes the whole run and uses the part it needs, the way a service-row
+# handler does. They assert the property their sink exists for, never that it is
+# merely reachable: a scrape that returns HTTP 200 with an empty body is the
+# original defect, and "the endpoint answered" would have called it healthy.
+jaeger_has_run() {
+  ct_output_holds "$2" jaeger_traces_tagged "$1" "$(jaeger_tag_of session.id "$2")"
+}
+
+clickhouse_has_run() {
+  clickhouse_returns_a_row \
+    "SELECT SpanId FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE SessionId = '$2'"
+}
+
+metrics_has_run() {
+  ct_output_holds "$2" \
+    curl -fs --max-time 5 "http://127.0.0.1:$CT_CLAUDE_METRICS_PORT/metrics"
+}
+
+# grep against the file rather than a captured copy: this one grows to 64 MB
+# before the exporter rotates it, and reading that into a shell variable sixty
+# times over a poll would be the expensive way to ask a cheap question. -s
+# because a missing file is the answer being computed, not a failure being
+# hidden -- the enforcer below is what reports it, by name.
+events_has_run() { grep -qsF -- "$2" "$CT_LOG_DIR/claude-events.jsonl"; }
+
+# [LAW:one-type-per-behavior] Every sink is the same kind of thing: a place a
+# signal lands, and a question whose answer means "this run's data is here". What
+# differs is data, so the enforcer iterates this table and there is no per-sink
+# code path. That is the property to keep: the next sink this stack grows should
+# cost one row here, because a sink that arrives as its own bespoke check is a
+# sink that starts drifting the day it lands.
+#
+# Fields: sink|holds-the-run|what a miss most likely means
+ct_sinks() {
+  cat <<'EOF'
+jaeger|jaeger_has_run|The collector accepted the span, so its otlp_grpc/jaeger exporter or badger is what did not; jaeger.log has the storage side.
+clickhouse|clickhouse_has_run|Likeliest cause is the exporter's INSERT no longer matching the table in config/clickhouse.yaml -- a collector upgrade that adds a column does exactly this; clickhouse.log has the rejection.
+metrics|metrics_has_run|An empty scrape body means the metrics pipeline delivered nothing at all; a body naming other sessions means this run's metrics alone went missing.
+events|events_has_run|The file/events exporter writes var/log/claude-events.jsonl directly, so an unchanged file means the logs pipeline itself is gone.
+EOF
+}
+
+# Blocks until every sink holds the run, or dies naming the first that does not.
+#
+# [LAW:single-enforcer] One rule for four sinks: a run missing from any of them is
+# a failed run. No sink carries its own patience or its own idea of how loudly to
+# complain, so a fifth cannot arrive with a weaker standard than the four.
+ct_await_run_in_every_sink() {
+  local service="$1" needle="$2" sink holds hint
+  while IFS='|' read -r sink holds hint; do
+    ct_poll_until "$SINK_TIMEOUT_SECONDS" "$holds" "$service" "$needle" \
+      || ct_die "the $sink sink never received this run.
+  Waited ${SINK_TIMEOUT_SECONDS}s for session.id '$needle' under service '$service'.
+  $hint
+  Check: ./ct status, and $CT_LOG_DIR/collector.log"
+    ct_ok "  $sink has it"
+  done < <(ct_sinks)
+}
+
+# --- stage 2: the synthetic run ---------------------------------------------
+# One payload per signal, each carrying the needle where that signal's sink will
+# index it. Spelled out rather than generated from a common builder: an OTLP
+# payload is the wire contract, and abstracting over the three shapes would hide
+# exactly the differences that matter on the day one of them stops arriving.
+#
+# The span's ids are derived from the needle rather than drawn separately -- a
+# uuid without its hyphens is exactly the 32 hex characters a trace id is -- so
+# the run has one identity and no second random value to carry around.
+# [LAW:one-source-of-truth]
+#
+# [LAW:effects-at-boundaries] These are pure: clock and network both live in the
+# emitter, so a payload can be printed and read without sending anything.
+otlp_attr() { printf '{"key":"%s","value":{"stringValue":"%s"}}' "$1" "$2"; }
+
+selftest_span() {
+  local needle="$1" now_ns="$2" trace_id
+  trace_id="${needle//-/}"
+  cat <<EOF
+{"resourceSpans":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+"scopeSpans":[{"spans":[{"traceId":"$trace_id","spanId":"${trace_id:0:16}",
+"name":"ct.selftest","kind":1,
+"startTimeUnixNano":"$now_ns","endTimeUnixNano":"$((now_ns + 1000000))",
+"attributes":[$(otlp_attr session.id "$needle")]}]}]}]}
+EOF
+}
+
+selftest_metric() {
+  local needle="$1" now_ns="$2"
+  cat <<EOF
+{"resourceMetrics":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+"scopeMetrics":[{"metrics":[{"name":"ct_selftest_runs","sum":{
+"aggregationTemporality":2,"isMonotonic":true,
+"dataPoints":[{"asInt":"1","startTimeUnixNano":"$now_ns","timeUnixNano":"$now_ns",
+"attributes":[$(otlp_attr session.id "$needle")]}]}}]}]}]}
+EOF
+}
+
+selftest_log() {
+  local needle="$1" now_ns="$2"
+  cat <<EOF
+{"resourceLogs":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+"scopeLogs":[{"logRecords":[{"timeUnixNano":"$now_ns",
+"body":{"stringValue":"ct.selftest"},
+"attributes":[$(otlp_attr session.id "$needle")]}]}]}]}
+EOF
+}
+
+# Fields: signal|payload
+ct_selftest_signals() {
+  cat <<'EOF'
+traces|selftest_span
+metrics|selftest_metric
+logs|selftest_log
+EOF
 }
 
 verify_transport() {
-  local trace_id span_id now_ns
-  trace_id="$(openssl rand -hex 16)"
-  span_id="$(openssl rand -hex 8)"
+  local needle now_ns signal payload
+  needle="$(ct_uuid)"
   now_ns=$(( $(date +%s) * 1000000000 ))
 
-  ct_info "stage 2/3: synthetic span -> collector -> both sinks"
-  curl -fsS --max-time 5 -o /dev/null \
-    -X POST "http://127.0.0.1:$CT_OTLP_HTTP_PORT/v1/traces" \
-    -H 'Content-Type: application/json' \
-    -d "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"$SELFTEST_SERVICE\"}}]},\"scopeSpans\":[{\"spans\":[{\"traceId\":\"$trace_id\",\"spanId\":\"$span_id\",\"name\":\"ct.selftest\",\"kind\":1,\"startTimeUnixNano\":\"$now_ns\",\"endTimeUnixNano\":\"$((now_ns + 1000000))\"}]}]}]}" \
-    || ct_die "the collector refused an OTLP/HTTP span on port $CT_OTLP_HTTP_PORT"
+  ct_info "stage 2/3: synthetic traces, metrics and logs -> collector -> every sink"
 
-  ct_await_in_jaeger "traces?service=$SELFTEST_SERVICE&lookback=1h" "$trace_id" "the synthetic span"
-  ct_ok "  transport works: $trace_id is queryable in Jaeger"
+  while IFS='|' read -r signal payload; do
+    curl -fsS --max-time 5 -o /dev/null \
+      -X POST "http://127.0.0.1:$CT_OTLP_HTTP_PORT/v1/$signal" \
+      -H 'Content-Type: application/json' \
+      -d "$("$payload" "$needle" "$now_ns")" \
+      || ct_die "the collector refused an OTLP/HTTP $signal payload on port $CT_OTLP_HTTP_PORT"
+  done < <(ct_selftest_signals)
 
-  # The same span, asked for in SQL. The fan-out means one sink can fail while
-  # the other passes, which is the whole point of having two -- and the reason
-  # this is a separate assertion rather than a second guess at the first one.
-  ct_await_in_clickhouse \
-    "SELECT SpanId FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE TraceId = '$trace_id'" \
-    "the synthetic span" \
-    "Jaeger has it, so the collector received it and the ClickHouse exporter is
-  what did not deliver. The likeliest cause is the exporter's insert no longer
-  matching the table in config/clickhouse.yaml -- a collector upgrade that adds
-  a column does exactly this. The error is in the collector log."
-  ct_ok "  and in ClickHouse: SELECT ... WHERE TraceId = '$trace_id'"
+  # The fan-out means one sink can fail while the others pass, which is the whole
+  # point of having four -- and the reason each is a separate assertion rather
+  # than a second guess at the first one.
+  ct_await_run_in_every_sink "$SELFTEST_SERVICE" "$needle"
+  ct_ok "  transport works: session.id '$needle' is queryable in all four"
 }
 
-# Jaeger's tag search takes a JSON object of tag/value pairs, ANDed together.
-# Rendering it from the same table the stamp comes from is what makes this a
-# check rather than a restatement: if a label is added, removed, or renamed, the
-# expectation moves with it and there is no second list here to forget.
-json_escape()        { local v="${1//\\/\\\\}"; printf '%s' "${v//\"/\\\"}"; }
-jaeger_tag_of()      { printf '"%s":"%s"' "$(json_escape "$1")" "$(json_escape "$2")"; }
-jaeger_label_query() { printf '{%s}' "$(ct_join_labels jaeger_tag_of)"; }
+# [LAW:verifiable-goals] Spans arriving is not the goal; spans you can group by
+# the work they were doing is. Asking Jaeger's tag search -- rather than grepping
+# the payload -- is deliberate: searchability is the property the labels exist
+# for, and it is the one that would rot unnoticed. Rendering the query from the
+# same table the stamp comes from is what makes it a check rather than a
+# restatement: add, remove or rename a label and the expectation moves with it,
+# because there is no second list here to forget.
+claude_labels_searchable() {
+  ct_output_holds "$1" jaeger_traces_tagged "$CLAUDE_SERVICE_NAME" \
+    "$(ct_join_labels jaeger_tag_of),$(jaeger_tag_of session.id "$1")"
+}
 
 verify_claude() {
-  local nonce labels
-  nonce="ct-selftest-$(openssl rand -hex 4)"
+  local needle labels
+  needle="$(ct_uuid)"
   labels="$(ct_work_labels)"
 
-  ct_info "stage 3/3: real claude session -> collector -> both sinks"
+  ct_info "stage 3/3: real claude session -> collector -> every sink"
 
   # Run through the launcher rather than around it, so this stage covers the
   # path a real session takes -- labels included -- instead of a shortcut that
-  # only resembles it. The prompt forces one tool call, so the probe exercises
-  # the whole span shape we came for: interaction -> llm_request + tool ->
-  # tool.execution. The nonce rides along in user_prompt and full_command, which
-  # is what makes the checks below about *this* run rather than any claude trace
-  # that happens to be lying around.
-  ( cmd_claude -p "Run the bash command \`echo $nonce\` and reply with nothing else." \
+  # only resembles it. --session-id is what makes the run identifiable before it
+  # has run: the needle stamped by hand in stage 2 is one Claude Code stamps on
+  # every span, metric and event of this session, so the same four sink probes
+  # answer for it. The prompt forces one tool call, so the probe exercises the
+  # whole span shape we came for: interaction -> llm_request + tool ->
+  # tool.execution.
+  ( cmd_claude --session-id "$needle" \
+      -p "Run the bash command \`echo $needle\` and reply with nothing else." \
       >/dev/null ) || ct_die "the claude probe run failed"
 
-  ct_await_in_jaeger \
-    "traces?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction&lookback=1h" \
-    "$nonce" "the claude interaction span" \
-    "Claude Code ran but its spans did not arrive. Most likely CLAUDE_CODE_ENHANCED_TELEMETRY_BETA
-  is not honoured by this build ($(claude --version)) or for this account."
+  ct_await_run_in_every_sink "$CLAUDE_SERVICE_NAME" "$needle"
+  ct_ok "  a real claude session reaches all four sinks"
 
-  ct_ok "  claude spans are in Jaeger under service '$CLAUDE_SERVICE_NAME'"
-
-  # [LAW:verifiable-goals] Spans arriving is not the goal; spans you can group by
-  # the work they were doing is. Asking Jaeger's tag search -- rather than
-  # grepping the payload -- is deliberate: searchability is the property the
-  # labels exist for, and it is the one that would rot unnoticed.
-  ct_await_in_jaeger \
-    "traces?service=$CLAUDE_SERVICE_NAME&tags=$(ct_percent_encode "$(jaeger_label_query)")&lookback=1h" \
-    "$nonce" "the work-unit labels" \
-    "The session's spans arrived, but a tag search for the labels it was launched
-  with did not find them: $labels
-  One malformed entry makes Claude Code drop the whole set silently."
+  # No polling here, and that is a claim rather than an omission: the sink check
+  # above already found a span of this session in Jaeger, and the labels ride on
+  # that same span's resource. If they are missing now they were never sent.
+  # [LAW:no-ambient-temporal-coupling]
+  claude_labels_searchable "$needle" \
+    || ct_die "the session's spans arrived, but a tag search for the labels it was
+  launched with did not find them: $labels
+  One malformed entry makes Claude Code drop the whole set silently.
+  Check: ./ct claude, which reports on stderr what it stamped."
 
   ct_ok "  work-unit labels are searchable: $labels"
 
@@ -377,21 +515,20 @@ verify_claude() {
   # identical to a column for something that never happened. By the time a query
   # returns a suspiciously round number, a year of history is already wrong.
   # So this asserts on the values, not the row count.
-  ct_await_in_clickhouse \
-    "SELECT SessionId, Model, ContextTokens
+  # Polled, unlike the labels above: the sink check passed on whichever of this
+  # session's spans arrived first, and the llm_request spans this asks about may
+  # still be in the next export batch. [LAW:no-ambient-temporal-coupling]
+  ct_poll_until "$SINK_TIMEOUT_SECONDS" clickhouse_returns_a_row \
+    "SELECT Model, ContextTokens
        FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
-      WHERE SpanType = 'llm_request'
-        AND SessionId != '' AND Model != '' AND Repository != '' AND ContextTokens > 0
-        AND SessionId IN (
-              SELECT SessionId FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
-               WHERE SpanType = 'interaction' AND SpanAttributes['user_prompt'] LIKE '%$nonce%')
+      WHERE SessionId = '$needle' AND SpanType = 'llm_request'
+        AND Model != '' AND Repository != '' AND ContextTokens > 0
       LIMIT 1" \
-    "the probe session's promoted columns" \
-    "The session's spans may well be in ClickHouse -- what failed is that
-  SpanType, SessionId, Model, Repository or ContextTokens came back empty on
-  them. Compare the attribute keys on a live span against the MATERIALIZED
-  expressions in config/clickhouse.yaml:
-    ./ct sql \"SELECT SpanAttributes FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE ORDER BY Timestamp DESC LIMIT 1 FORMAT Vertical\""
+    || ct_die "the probe session's promoted columns are empty.
+  Its spans are in ClickHouse -- what failed is that SpanType, Model, Repository
+  or ContextTokens came back empty on them. Compare the attribute keys on a live
+  span against the MATERIALIZED expressions in config/clickhouse.yaml:
+    ./ct sql \"SELECT SpanAttributes FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE SessionId = '$needle' ORDER BY Timestamp DESC LIMIT 1 FORMAT Vertical\""
 
   ct_ok "  spans are grouped by span type, session, model, repo and context size"
   echo
