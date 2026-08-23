@@ -224,3 +224,9 @@ Span totals follow from the counts: `interactions + assistant_msgs + 3 × tool_c
 
 Epic `claude-analytics-zbi` in this repo's lit backlog, seven children in rank order.
 `lit backlog` for the queue, `lit show claude-analytics-zbi` for the plan.
+
+The epic is not the whole backlog. Five repo-hygiene items sit below it — the `ct down`
+pidfile ordering bug, the `ct logs` glob on a fresh checkout, darwin/arm64-only tool pins,
+autostart, and the all-or-nothing env profile. They rank lower because unrecorded data is
+perishable and a shell glob is not, which is a statement about ordering, not about whether
+they matter.
