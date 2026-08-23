@@ -1,0 +1,77 @@
+# OpenTelemetry Collector -- the single endpoint Claude Code exports to.
+#
+# Claude Code emits three signals; Jaeger accepts exactly one of them. Without
+# this fan-out, pointing Claude straight at Jaeger would leave its metrics and
+# logs pipelines answering Unimplemented and two thirds of the telemetry would
+# disappear without anyone being told. Every signal gets a real sink here.
+#
+# Ports come from lib/common.sh via ${env:...}; nothing is restated.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:${env:CT_OTLP_GRPC_PORT}
+      http:
+        endpoint: 127.0.0.1:${env:CT_OTLP_HTTP_PORT}
+
+processors:
+  # Small timeout: this is an interactive dev loop, so a span should be visible
+  # in the UI a couple of seconds after the tool call finishes, not a minute.
+  batch:
+    timeout: 2s
+
+exporters:
+  otlp_grpc/jaeger:
+    endpoint: 127.0.0.1:${env:CT_JAEGER_OTLP_PORT}
+    tls:
+      insecure: true
+
+  # Claude's counters (tokens, cost, tool decisions) as a scrape surface. Curl it
+  # directly, or point a Prometheus at it later -- no extra process needed today.
+  prometheus:
+    endpoint: 127.0.0.1:${env:CT_CLAUDE_METRICS_PORT}
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Events (user prompts, tool results, API errors) land as newline-delimited
+  # JSON: durable, greppable, and joinable to spans by session.id / tool_use_id.
+  file/events:
+    path: ${env:CT_VAR_DIR}/log/claude-events.jsonl
+    rotation:
+      max_megabytes: 64
+      max_backups: 3
+
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:${env:CT_COLLECTOR_HEALTH_PORT}
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/events]
+  telemetry:
+    resource:
+      attributes:
+        - name: service.name
+          value: claude-tracing-collector
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: ${env:CT_COLLECTOR_TELEMETRY_PORT}
+    logs:
+      level: info

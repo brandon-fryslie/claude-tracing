@@ -1,0 +1,74 @@
+# Jaeger v2 -- trace storage and UI.
+#
+# Jaeger v2 is itself an OpenTelemetry Collector distribution, which is why this
+# file looks like collector.yaml: same schema, same ${env:...} expansion, same
+# --config flag. It differs only in what it receives (traces from the collector,
+# not from Claude) and where it puts them (badger on disk, not another hop).
+#
+# Its OTLP receiver deliberately sits on 14317: the collector owns 4317, so
+# there is exactly one address Claude Code is ever told about.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:${env:CT_JAEGER_OTLP_PORT}
+
+processors:
+  batch:
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: claude_traces
+
+extensions:
+  healthcheckv2:
+    use_v2: true
+    http:
+      endpoint: 127.0.0.1:${env:CT_JAEGER_HEALTH_PORT}
+
+  jaeger_query:
+    storage:
+      traces: claude_traces
+    http:
+      endpoint: 127.0.0.1:${env:CT_JAEGER_UI_PORT}
+
+  jaeger_storage:
+    backends:
+      claude_traces:
+        # On-disk, not in-memory: sessions you traced yesterday are the ones
+        # worth comparing against, and a restart must not erase them.
+        badger:
+          directories:
+            keys: ${env:CT_VAR_DIR}/jaeger/keys
+            values: ${env:CT_VAR_DIR}/jaeger/values
+          ephemeral: false
+          ttl:
+            spans: ${env:CT_TRACE_TTL}
+
+service:
+  extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]
+  telemetry:
+    resource:
+      attributes:
+        - name: service.name
+          value: jaeger
+    # Jaeger self-traces its own query API to localhost:4317 -- our collector,
+    # which stores it straight back into Jaeger beside your Claude traces. Neither
+    # `traces.level: none` nor `traces.processors: []` here stops it; the switch
+    # that works is OTEL_TRACES_EXPORTER=none in the process environment, which ct
+    # sets for both daemons. Noted here because this is where you would look.
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: ${env:CT_JAEGER_TELEMETRY_PORT}
+    logs:
+      level: info

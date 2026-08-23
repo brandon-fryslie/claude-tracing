@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+#
+# ct -- run a local OpenTelemetry + Jaeger stack and point Claude Code at it.
+#
+#   ./ct up        fetch pinned binaries, start the stack, wait until it answers
+#   ./ct env       print the exports that make Claude Code emit spans
+#   ./ct verify    prove end to end that a Claude span reaches Jaeger
+#   ./ct status    what is running, and is it answering
+#   ./ct logs      tail both service logs
+#   ./ct ui        open the Jaeger UI
+#   ./ct down      stop the stack
+
+set -euo pipefail
+
+CT_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$CT_SELF_DIR/lib/common.sh"
+. "$CT_SELF_DIR/lib/tools.sh"
+
+READY_TIMEOUT_SECONDS=30
+SELFTEST_SERVICE=claude-tracing-selftest
+
+# Claude Code's own resource service.name. cmd_env deliberately does not set
+# OTEL_SERVICE_NAME, so this is the name spans arrive under -- and cmd_env is why
+# that is true, which is what keeps this constant honest rather than a guess.
+CLAUDE_SERVICE_NAME=claude-code
+
+# --- service lifecycle ------------------------------------------------------
+# Every function below operates on a row of ct_services(). There is no
+# per-service code path anywhere in this file.
+
+# A failing probe is this function's return value, not an error to report: the
+# caller polls it, and ct_await_ready is what speaks up when the polling runs
+# out. Hence -fs (quiet on failure) rather than -fsS.
+ct_probe() { curl -fs --max-time 2 -o /dev/null "$1"; }
+
+# Blocks until the service answers its readiness URL, or dies with the tail of
+# its own log. [LAW:no-ambient-temporal-coupling] the gate is the condition we
+# actually depend on -- the query API answering -- never an elapsed sleep.
+ct_await_ready() {
+  local name="$1" url="$2" deadline
+  deadline=$(( $(date +%s) + READY_TIMEOUT_SECONDS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ct_probe "$url"; then return 0; fi
+    sleep 0.2
+  done
+  ct_warn "--- last 20 lines of $(ct_logfile "$name") ---"
+  tail -n 20 "$(ct_logfile "$name")" >&2
+  ct_die "$name did not become ready at $url within ${READY_TIMEOUT_SECONDS}s"
+}
+
+ct_start_service() {
+  local name="$1" bin="$2" config="$3" ready="$4" pid
+  pid="$(ct_pid_of "$name")"
+  if [ -n "$pid" ]; then
+    ct_info "$name already running (pid $pid)"
+    return 0
+  fi
+  [ -x "$bin" ] || ct_die "$name binary missing at $bin -- run './ct up'"
+
+  # [LAW:single-enforcer] One rule for both daemons: a service in this stack never
+  # exports its own telemetry into the stack. Jaeger self-traces to localhost:4317
+  # by default, and a shell that has sourced `./ct env` would hand both services
+  # the exporter contract meant for Claude. Either way you get the stack's own
+  # chatter stored beside your Claude traces. Neutralised once, here.
+  # BSD env insists every -u precede the first NAME=VALUE; GNU env accepts both.
+  nohup env \
+    -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
+    -u OTEL_EXPORTER_OTLP_HEADERS -u CLAUDE_CODE_ENABLE_TELEMETRY \
+    OTEL_TRACES_EXPORTER=none \
+    "$bin" --config "$config" >>"$(ct_logfile "$name")" 2>&1 &
+  printf '%s\n' "$!" > "$(ct_pidfile "$name")"
+  ct_await_ready "$name" "$ready"
+  ct_ok "$name ready (pid $(cat "$(ct_pidfile "$name")"))"
+}
+
+ct_stop_service() {
+  local name="$1" pid deadline
+  pid="$(ct_pid_of "$name")"
+  rm -f "$(ct_pidfile "$name")"
+  if [ -z "$pid" ]; then
+    ct_info "$name not running"
+    return 0
+  fi
+  kill "$pid"
+  deadline=$(( $(date +%s) + 10 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$(date +%s)" -lt "$deadline" ] || ct_die "$name (pid $pid) ignored SIGTERM for 10s"
+    sleep 0.2
+  done
+  ct_ok "$name stopped"
+}
+
+# --- subcommands ------------------------------------------------------------
+
+cmd_up() {
+  mkdir -p "$CT_BIN_DIR" "$CT_RUN_DIR" "$CT_LOG_DIR" "$CT_VAR_DIR/jaeger"
+  ct_install_tools
+  local name bin config ready
+  while IFS='|' read -r name bin config ready; do
+    ct_start_service "$name" "$bin" "$config" "$ready"
+  done < <(ct_services)
+  echo
+  ct_ok "Jaeger UI  http://127.0.0.1:$CT_JAEGER_UI_PORT"
+  ct_info "OTLP in   127.0.0.1:$CT_OTLP_GRPC_PORT (gRPC)  127.0.0.1:$CT_OTLP_HTTP_PORT (HTTP)"
+  ct_info "Metrics   http://127.0.0.1:$CT_CLAUDE_METRICS_PORT/metrics"
+  ct_info "Events    $CT_LOG_DIR/claude-events.jsonl"
+  echo
+  ct_trace "Next:  source <(./ct env)   then run claude in that shell"
+}
+
+cmd_down() {
+  local name rest
+  while IFS='|' read -r name rest; do
+    ct_stop_service "$name"
+  done < <(ct_services)
+}
+
+cmd_status() {
+  local name bin config ready pid state
+  while IFS='|' read -r name bin config ready; do
+    pid="$(ct_pid_of "$name")"
+    state="stopped"
+    if [ -n "$pid" ]; then
+      state="running (pid $pid), not answering $ready"
+      if ct_probe "$ready"; then state="ready (pid $pid)"; fi
+    fi
+    printf '%-10s %s\n' "$name" "$state"
+  done < <(ct_services)
+}
+
+cmd_logs() {
+  tail -n 40 -F "$CT_LOG_DIR"/*.log
+}
+
+cmd_ui() {
+  open "http://127.0.0.1:$CT_JAEGER_UI_PORT"
+}
+
+# The exporter contract, generated from the same constants the stack binds to,
+# so the endpoint Claude is told about cannot drift from the one that is
+# listening. Emitted as data -- source it, paste it into ~/.claude/settings.json,
+# or wrap it in a launcher; that choice is the caller's.
+cmd_env() {
+  cat <<EOF
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1
+export OTEL_TRACES_EXPORTER=otlp
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_LOGS_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:$CT_OTLP_GRPC_PORT
+export OTEL_TRACES_EXPORT_INTERVAL=5000
+export OTEL_LOGS_EXPORT_INTERVAL=5000
+export OTEL_METRIC_EXPORT_INTERVAL=10000
+export OTEL_LOG_USER_PROMPTS=1
+export OTEL_LOG_TOOL_DETAILS=1
+export OTEL_METRICS_INCLUDE_SESSION_ID=true
+EOF
+}
+
+# --- verification -----------------------------------------------------------
+# [LAW:verifiable-goals] "the stack is up" is not the goal; "a Claude span is
+# queryable in Jaeger" is. Both stages run every time: stage one isolates the
+# transport, stage two exercises the thing you actually came for.
+
+jaeger_api() { curl -fsS --max-time 5 "http://127.0.0.1:$CT_JAEGER_UI_PORT/api/$1"; }
+
+# Polls Jaeger until the needle shows up in the given API path, or fails.
+ct_await_in_jaeger() {
+  local path="$1" needle="$2" what="$3" hint="${4:-}" deadline
+  deadline=$(( $(date +%s) + 30 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if jaeger_api "$path" | grep -q "$needle"; then return 0; fi
+    sleep 1
+  done
+  ct_die "$what never reached Jaeger.
+  Looked for '$needle' in /api/$path for 30s.
+  ${hint:+$hint
+  }Check: ./ct status, and $CT_LOG_DIR/collector.log"
+}
+
+verify_transport() {
+  local trace_id span_id now_ns
+  trace_id="$(openssl rand -hex 16)"
+  span_id="$(openssl rand -hex 8)"
+  now_ns=$(( $(date +%s) * 1000000000 ))
+
+  ct_info "stage 1/2: synthetic span -> collector -> jaeger"
+  curl -fsS --max-time 5 -o /dev/null \
+    -X POST "http://127.0.0.1:$CT_OTLP_HTTP_PORT/v1/traces" \
+    -H 'Content-Type: application/json' \
+    -d "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"$SELFTEST_SERVICE\"}}]},\"scopeSpans\":[{\"spans\":[{\"traceId\":\"$trace_id\",\"spanId\":\"$span_id\",\"name\":\"ct.selftest\",\"kind\":1,\"startTimeUnixNano\":\"$now_ns\",\"endTimeUnixNano\":\"$((now_ns + 1000000))\"}]}]}]}" \
+    || ct_die "the collector refused an OTLP/HTTP span on port $CT_OTLP_HTTP_PORT"
+
+  ct_await_in_jaeger "traces?service=$SELFTEST_SERVICE&lookback=1h" "$trace_id" "the synthetic span"
+  ct_ok "  transport works: $trace_id is queryable in Jaeger"
+}
+
+verify_claude() {
+  local nonce
+  nonce="ct-selftest-$(openssl rand -hex 4)"
+
+  ct_info "stage 2/2: real claude session -> collector -> jaeger"
+  command -v claude >/dev/null || ct_die "'claude' is not on PATH"
+
+  # The prompt forces one tool call, so the probe exercises the whole span shape
+  # we came for: interaction -> llm_request + tool -> tool.execution. The nonce
+  # rides along in user_prompt and full_command, which is what makes the check
+  # below about *this* run rather than any claude trace that happens to be here.
+  ( eval "$(cmd_env)"
+    claude -p "Run the bash command \`echo $nonce\` and reply with nothing else." \
+      >/dev/null ) || ct_die "the claude probe run failed"
+
+  ct_await_in_jaeger \
+    "traces?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction&lookback=1h" \
+    "$nonce" "the claude interaction span" \
+    "Claude Code ran but its spans did not arrive. Most likely CLAUDE_CODE_ENHANCED_TELEMETRY_BETA
+  is not honoured by this build ($(claude --version)) or for this account."
+
+  ct_ok "  claude spans are in Jaeger under service '$CLAUDE_SERVICE_NAME'"
+  echo
+  ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
+}
+
+cmd_verify() {
+  verify_transport
+  verify_claude
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+usage() {
+  sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  status) cmd_status ;;
+  logs)   cmd_logs ;;
+  ui)     cmd_ui ;;
+  env)    cmd_env ;;
+  verify) cmd_verify ;;
+  *)      usage; exit 1 ;;
+esac

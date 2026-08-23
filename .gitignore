@@ -1,0 +1,3 @@
+# Downloaded binaries, pidfiles, service logs, badger trace storage, and the
+# captured event stream. All of it is reproducible from `./ct up`.
+/var/
