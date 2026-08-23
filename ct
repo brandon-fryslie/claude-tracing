@@ -531,9 +531,41 @@ verify_claude() {
     ./ct sql \"SELECT SpanAttributes FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE SessionId = '$needle' ORDER BY Timestamp DESC LIMIT 1 FORMAT Vertical\""
 
   ct_ok "  spans are grouped by span type, session, model, repo and context size"
+
+  # [LAW:verifiable-goals] Promoted columns being populated is not the goal
+  # either; the tool-cost definition built on them holding is. That definition is
+  # the one thing here that no sink check can catch, because it fails by going
+  # quiet: it reads stop_reason and the order of requests under a parent, so a
+  # renamed value or a reparented span makes ServesToolCall uniformly false and
+  # every answer about tool spend becomes 0 -- a number shaped exactly like "you
+  # used no tools" and indistinguishable from it.
+  #
+  # The probe prompt forces one tool call, so this session must contain the
+  # pairing the definition is made of: a request that ended in tool_use, and the
+  # request after it carrying the result back. Asserting ToolResultTokens > 0 is
+  # what makes it a check on the pairing rather than on the flag -- the flag can
+  # be true by accident, but a positive context delta means two specific rows were
+  # matched to each other correctly.
+  ct_poll_until "$SINK_TIMEOUT_SECONDS" clickhouse_returns_a_row \
+    "SELECT ToolResultTokens
+       FROM $CT_CLICKHOUSE_DATABASE.llm_requests
+      WHERE SessionId = '$needle' AND ServesToolCall
+        AND CarriesToolResult AND ToolResultTokens > 0 AND TotalTokens > 0
+      LIMIT 1" \
+    || ct_die "the probe session made a tool call, but claude.llm_requests cannot
+  see it. The view pairs each llm_request with the one before it under the same
+  parent span; that pairing is what attributes tokens to tool usage, and nothing
+  else in this stack would notice it breaking.
+  Compare what the probe actually emitted against what the view expects:
+    ./ct sql \"SELECT Timestamp, SpanId, ParentSpanId, StopReason, RequestContext, ContextTokens, OutputTokens FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE SessionId = '$needle' AND SpanType = 'llm_request' ORDER BY Timestamp FORMAT PrettyCompact\"
+  A StopReason that is no longer 'tool_use', or an llm_request no longer sharing a
+  parent with its neighbours, is the definition in config/clickhouse.yaml going stale."
+
+  ct_ok "  tokens are attributable to tool usage: the request pairing holds"
   echo
   ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
   ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
+  ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.llm_requests WHERE toYYYYMM(Timestamp) = 202603\""
 }
 
 cmd_verify() {
