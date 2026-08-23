@@ -10,10 +10,14 @@ Both are native binaries. There is no Docker, no VM, and nothing to install glob
 
 ```bash
 ./ct up                  # fetch binaries, start the stack, wait until it answers
-source <(./ct env)       # point this shell's claude at the collector
-claude                   # work normally
+./ct claude              # work normally, traced and labelled
 open http://127.0.0.1:16686
 ```
+
+`./ct claude` runs Claude in whatever directory you are standing in, so from another
+project you call it by path — `~/code/claude-tracing/ct claude` — or alias it. It prints
+the labels it stamped before handing over, and passes every argument through, so
+`./ct claude -p 'hi'` and `./ct claude --resume` work as usual.
 
 To prove the whole path works before you trust it:
 
@@ -21,10 +25,12 @@ To prove the whole path works before you trust it:
 ./ct verify
 ```
 
-That sends a synthetic span through the collector and waits for it in Jaeger, then runs
-a real one-prompt `claude -p` session and waits for *its* span. Both stages plant a
-random nonce and search for that exact string, so a pass means this run's data arrived,
-not that some older trace is still lying around.
+Three stages, cheapest first. It checks the label encoding without touching the network,
+sends a synthetic span through the collector and waits for it in Jaeger, then runs a real
+one-prompt session through the launcher and waits for *its* span — and for a Jaeger tag
+search on the labels that session was launched with. Every stage that talks to Jaeger
+plants a random nonce and searches for that exact string, so a pass means this run's data
+arrived, not that some older trace is still lying around.
 
 ## What you get
 
@@ -54,6 +60,42 @@ spent working from the time it spent waiting on you to hit approve.
 
 Jaeger 2.20 also has a **GenAI View** toggle in the trace header, next to the search
 box, which reads the `gen_ai.*` attributes Claude Code sets.
+
+## Knowing what a session was for
+
+Claude Code's own attributes describe the session — model, tokens, timings, identity —
+and say nothing about the work. So "how many turns did that ticket take" has nothing to
+group by, and no storage engine fixes that later: an attribute that was never emitted
+can't be backfilled. `./ct claude` fills the gap, stamping onto every span of the session:
+
+| Attribute | Value |
+| ------------------------------ | ------------------------------------------------ |
+| `vcs.repository.name`          | the git repository's directory name              |
+| `vcs.ref.head.name`            | the current branch; absent on a detached HEAD    |
+| `process.working_directory`    | where you launched from                          |
+
+Those are OpenTelemetry semantic conventions rather than names invented here, and they
+arrive as Jaeger *process* tags — so one tag search pulls every span of every session
+that ran in a given repo or on a given branch. Launch somewhere that isn't a git
+checkout and the two `vcs.*` labels are simply absent, which reads as "doesn't apply"
+rather than as a branch whose name is the empty string.
+
+Whatever you set in `OTEL_RESOURCE_ATTRIBUTES` yourself is kept and merged, so you can
+label the things this repo can't derive — like what the session is *for*:
+
+```bash
+OTEL_RESOURCE_ATTRIBUTES=session.purpose=code-review ./ct claude
+```
+
+One warning, measured rather than assumed: a single raw space anywhere in
+`OTEL_RESOURCE_ATTRIBUTES` makes Claude Code discard *every* attribute in the string,
+silently, including the well-formed ones beside it. `ct claude` percent-encodes what it
+derives and refuses to launch if what you passed in would poison the set. If you set that
+variable by hand for a plain `claude`, encode the spaces as `%20` yourself.
+
+The labels describe the directory you launched from, which is why they are computed at
+launch and are not part of `./ct env`. A shell that sourced the env in one repo would go
+on claiming that repo long after you'd moved to another.
 
 ## How it's wired
 
@@ -94,6 +136,8 @@ None of this leaves the machine, but it is more than timings. The default env pr
 - **Bash commands, file paths, skill names, and subagent types** on tool spans (`OTEL_LOG_TOOL_DETAILS=1`).
 - **Your email, account UUID, and organization id** as labels on every metric. That is
   Claude Code's own default label set, not something this repo adds.
+- **The repository, branch, and absolute working directory** you launched in, on every
+  span of a session started with `./ct claude`. This one *is* something this repo adds.
 
 Tool inputs and outputs are *not* captured. Add `export OTEL_LOG_TOOL_CONTENT=1` after
 sourcing if you want them — every file you read and every command's output becomes a
@@ -114,9 +158,11 @@ Traces live in badger under `var/jaeger` and expire after 7 days (`CT_TRACE_TTL`
 Everything under `var/` is disposable and gitignored — binaries, pidfiles, logs, and
 storage all come back from `./ct up`.
 
-If you'd rather trace every session without sourcing anything, paste the output of
-`./ct env` into the `env` block of `~/.claude/settings.json`. Claude Code will then try
-to export whether or not the stack is up.
+If you'd rather trace every session without going through the launcher, paste the output
+of `./ct env` into the `env` block of `~/.claude/settings.json`. Claude Code will then try
+to export whether or not the stack is up. That route carries the transport but not the
+work-unit labels, which have to be computed per launch — those sessions land in Jaeger
+with no repo and no branch on them.
 
 ## Troubleshooting
 
@@ -125,6 +171,10 @@ to export whether or not the stack is up.
 arrive, your build or account may not have it — verified working on Claude Code 2.1.226.
 Run `./ct verify`: if stage 1 passes and stage 2 fails, the stack is fine and the
 problem is on Claude's side.
+
+**Spans arrive with no repo or branch on them.** They were emitted by a `claude` that
+didn't go through `./ct claude` — a shell that sourced `./ct env`, or the settings.json
+route. Both carry the transport and neither carries the labels.
 
 **A service won't start.** `./ct up` prints the last 20 lines of that service's log
 before giving up. The full logs are in `var/log/`.

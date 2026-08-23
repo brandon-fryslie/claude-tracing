@@ -25,8 +25,8 @@ no git branch, no ticket, no notion of what the session was for.
 | --- | --- | --- |
 | Tokens on tool usage in March | Yes | — |
 | Where tokens go past 400k context | Yes | — |
-| Avg turns to complete a ticket | **No** | which ticket, and whether it completed |
-| Opus 5 vs 4.8 review convergence | **No** | what marks a session as a review |
+| Avg turns to complete a ticket | **Not yet** | which ticket, and whether it completed |
+| Opus 5 vs 4.8 review convergence | **Not yet** | what marks a session as a review |
 
 That gap sets the priority for everything else. Storage can be migrated; an attribute
 that was never emitted is gone. **What gets recorded is perishable. Where it's stored is
@@ -34,10 +34,13 @@ not.** Every day without work-unit labels is another day that can never answer q
 3 and 4, retroactively, forever — which is why the labelling ticket outranks the more
 interesting ClickHouse ticket.
 
-The likely fix is cheap. OTel's `OTEL_RESOURCE_ATTRIBUTES` stamps arbitrary key-values
-onto every span a process emits, so a launcher setting repo, branch, and current ticket
-would put the join key on all ~50 spans of a session at no marginal cost. **This is
-assumed, not verified** — see the confidence table below.
+The fix was cheap, and as of 2026-08-23 it is in: `./ct claude` stamps
+`vcs.repository.name`, `vcs.ref.head.name`, and `process.working_directory` onto every
+span of the session through `OTEL_RESOURCE_ATTRIBUTES`, and they are searchable as Jaeger
+process tags. That closes the "which repo, which branch" half of the gap for every
+session launched that way. Both remaining columns above need one more join each — the
+ticket and its completion (ticket 6), and whatever marks a session as a review, which
+nothing derives automatically and which rides in on the launcher's passthrough.
 
 ## Volume, measured
 
@@ -162,8 +165,21 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | 209,000 spans/month, ~474 MB/month, ~5.7 GB/year | **Derived** — measured counts × measured sizes |
 | Attribute inventory, absence of cost field | **Measured** — every key across live traces |
 | ClickHouse compression 20–50× → 150–400 MB/year | **Assumed** — reasoned from the 60% redundancy, not benchmarked |
-| Claude Code honors `OTEL_RESOURCE_ATTRIBUTES` | **Assumed** — standard OTel SDK behavior, untested here |
+| Claude Code honors `OTEL_RESOURCE_ATTRIBUTES` | **Measured** — 2.1.226; attributes land as Jaeger process tags and answer a tag search |
+| One raw space discards the whole attribute set | **Measured** — controlled pair, one variable changed; see below |
 | Events pipeline volume vs its 256 MB ceiling | **Unmeasured** — nobody has counted; ticket 7 measures first |
+
+The encoding result is worth stating on its own, because its failure mode is invisible.
+Two runs of the same prompt, one variable changed:
+
+| `OTEL_RESOURCE_ATTRIBUTES` | What reached Jaeger |
+| --- | --- |
+| `ct.nonce=X,ct.enc=a%20b%2Cc` | both attributes, decoded to `a b,c` |
+| `ct.nonce=X,ct.enc=a b` | nothing — including the well-formed `ct.nonce` |
+
+There is no partial parse and no complaint. Since git permits commas in branch names and
+paths routinely contain spaces, percent-encoding the values isn't tidiness — it's what
+stands between one stray character and a session labelled with nothing at all.
 
 Two live defects found along the way, both recorded as tickets:
 
@@ -171,9 +187,11 @@ Two live defects found along the way, both recorded as tickets:
   arrives — `otelcol_exporter_sent_metric_points{exporter="prometheus"} 7` — and then
   evaporates, because a scrape surface drops series nothing pulls. An empty 200 is the
   worst possible answer: shaped exactly like success, meaning *I lost your data*.
-- `ct verify` proves only that traces reach Jaeger, so the above rotted undetected for
+- `ct verify` proved only that traces reach Jaeger, so the above rotted undetected for
   hours while verify passed. Any new sink needs to be inside verify's definition of done,
-  or it will rot the same way.
+  or it will rot the same way. Work-unit labels were brought inside it when they landed —
+  verify now tag-searches Jaeger for the labels the probe session was launched with. The
+  metrics endpoint still isn't covered; that's ticket 3.
 
 ## Re-measuring
 
