@@ -38,6 +38,19 @@ CT_CLICKHOUSE_DATA_DIR="$CT_VAR_DIR/clickhouse"
 CT_CLICKHOUSE_DATABASE=claude
 CT_CLICKHOUSE_TABLE=spans
 
+# The request-grain view over that table: one row per llm_request, carrying what
+# it cost and what it had to do with a tool call. Named here rather than spelled
+# out at each of its three uses in `ct`, so renaming it is one edit and not four.
+#
+# Unlike CT_CLICKHOUSE_TABLE above -- which collector.yaml reads as the
+# exporter's traces_table_name, and so genuinely configures something -- nothing
+# is configured from this. It buys drift protection only, and it does not make
+# the name single-sourced: config/clickhouse.yaml still holds the authoritative
+# CREATE VIEW. This is the same trade the table makes, held true the same way, by
+# a check that fails loudly rather than by trust -- there, ClickHouse's readiness
+# query; here, the `ct verify` assertion that queries this view by name.
+CT_CLICKHOUSE_REQUESTS_VIEW=llm_requests
+
 # How long spans survive on disk before badger expires them.
 #
 # ClickHouse's own retention is not here, and deliberately: it is a TTL clause
@@ -53,7 +66,7 @@ export CT_COLLECTOR_TELEMETRY_PORT CT_CLAUDE_METRICS_PORT
 export CT_JAEGER_OTLP_PORT CT_JAEGER_UI_PORT CT_JAEGER_HEALTH_PORT
 export CT_JAEGER_TELEMETRY_PORT CT_TRACE_TTL
 export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
-export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE
+export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_REQUESTS_VIEW
 
 # --- pinned tool releases ---------------------------------------------------
 CT_JAEGER_VERSION=2.20.0

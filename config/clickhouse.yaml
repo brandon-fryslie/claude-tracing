@@ -208,8 +208,15 @@ startup_scripts:
     # return a number that looks entirely reasonable. [LAW:one-source-of-truth]
     #
     # A plain view, so it costs no storage and cannot fall behind the table.
+    #
+    # OR REPLACE, unlike the table above, and the asymmetry is the point: a view
+    # holds no data, so restating it on every start costs nothing and keeps this
+    # file authoritative over what the server actually has. Under IF NOT EXISTS an
+    # edited definition would apply on a fresh checkout and be silently ignored on
+    # every machine that already ran once -- two definitions of one fact, and no
+    # way to tell which one answered your query. [LAW:one-source-of-truth]
     - query: |
-        CREATE VIEW IF NOT EXISTS claude.subagent_requests AS
+        CREATE OR REPLACE VIEW claude.subagent_requests AS
         SELECT
           request.Timestamp           AS Timestamp,
           request.SessionId           AS SessionId,
@@ -227,3 +234,105 @@ startup_scripts:
         JOIN claude.spans AS execution  ON request.ParentSpanId   = execution.SpanId
         JOIN claude.spans AS agent_tool ON execution.ParentSpanId = agent_tool.SpanId
         WHERE request.SpanType = 'llm_request' AND request.RequestContext = 'tool'
+
+    # The other thing the flat table cannot express: what a request had to do with
+    # a tool call. Tokens are on llm_request spans, tools are on tool spans, and
+    # they are siblings under an interaction -- so the link is not a join, it is
+    # the ORDER of requests. A request that ends `stop_reason='tool_use'` is the
+    # model deciding to call a tool; the request that comes NEXT under the same
+    # parent is the one carrying that tool's output back into context. The second
+    # is where the money is, because a tool returning 40 KB is paid for on the
+    # next request rather than its own.
+    #
+    # That ordering is the whole difficulty, and it is stated once here for the
+    # same reason the two-hop walk above is: re-derived per query it would
+    # eventually be got wrong by one row and return a number that looks entirely
+    # reasonable. Every question about tool cost reads this view.
+    # [LAW:one-source-of-truth]
+    #
+    # THE DEFINITION, so that later questions inherit it rather than re-choosing:
+    # a request SERVES a tool call when it decided to make one, carries one's
+    # result, or ran inside one. The third clause is the subagents: a request with
+    # `RequestContext='tool'` exists only because the Agent tool was called, so
+    # its tokens are tool spend as squarely as the other two -- and leaving it out
+    # silently drops an entire category, which at a 20:1 subagent-to-turn ratio is
+    # most of the bill.
+    #
+    # `ServesToolCall` is a union over requests, not a sum over tool calls -- a
+    # request meeting all three clauses is still one request, counted once, which
+    # is what makes `sum(TotalTokens) WHERE ServesToolCall` an honest share of the
+    # month rather than a figure that can exceed it. The clauses stay separately
+    # visible (`EndedInToolCall`, `CarriesToolResult`, `RequestContext`) so the
+    # union can always be taken apart again.
+    #
+    # `ToolResultTokens` is the sharper, smaller number underneath: how far the
+    # context grew beyond what the model itself wrote, which is the tool's output
+    # measured in tokens. It is left signed rather than clamped at zero -- across
+    # every observed pair it is positive, so a negative one is real news (a
+    # context rewritten between two requests) and clamping would bury it.
+    # [LAW:no-silent-failure]
+    #
+    # One partition key covers all three request populations with no special
+    # case: main-agent requests hang off their `interaction` span, a subagent's
+    # off the `tool.execution` that spawned it, and `standalone` requests (title
+    # generation) off nothing at all. SpanId breaks Timestamp ties so the view
+    # answers the same way twice. [LAW:no-ambient-temporal-coupling]
+    #
+    # That third population is why the key falls back to SpanId. An empty
+    # ParentSpanId is not a parent they share, it is the absence of one, so
+    # partitioning on it directly would file every parentless request in a
+    # session under one window and let lagInFrame pair two requests that have
+    # nothing to do with each other. Falling back to the row's own SpanId makes
+    # each of them a partition of one: lagInFrame finds no predecessor,
+    # CarriesToolResult is false and ToolResultTokens is 0, by construction
+    # rather than by a filter every query would have to remember.
+    # [LAW:types-are-the-program]
+    - query: |
+        CREATE OR REPLACE VIEW claude.llm_requests AS
+        SELECT
+          Timestamp,
+          SessionId,
+          SpanId,
+          ParentSpanId,
+          Duration,
+          Model,
+          RequestContext,
+          -- Carried through rather than consumed: it is what EndedInToolCall is
+          -- derived from, so keeping it here lets a reader check that derivation
+          -- against the row in front of them instead of against this file. Its
+          -- other values (end_turn, max_tokens, refusal) are request-level facts
+          -- in their own right.
+          StopReason,
+          AgentId,
+          Repository,
+          Branch,
+          InputTokens,
+          OutputTokens,
+          CacheReadTokens,
+          CacheCreationTokens,
+          ContextTokens,
+
+          -- Everything read plus everything written. A token count and not a
+          -- cost: cache reads, fresh input and output are billed at different
+          -- rates, and dollars arrive with their own column later.
+          ContextTokens + OutputTokens AS TotalTokens,
+
+          -- CAST to Bool because comparing a LowCardinality(String) yields a
+          -- LowCardinality(UInt8), which ClickHouse refuses to store as a column.
+          -- The wrapper is an artifact of how StopReason is encoded, never of
+          -- what these three mean, so it is dropped where it appears.
+          CAST(StopReason = 'tool_use' AS Bool) AS EndedInToolCall,
+          CAST(lagInFrame(StopReason) OVER w = 'tool_use' AS Bool) AS CarriesToolResult,
+          CAST(EndedInToolCall
+               OR CarriesToolResult
+               OR RequestContext = 'tool' AS Bool) AS ServesToolCall,
+
+          if(CarriesToolResult,
+             ContextTokens - lagInFrame(ContextTokens) OVER w
+                           - lagInFrame(OutputTokens) OVER w,
+             0) AS ToolResultTokens
+        FROM claude.spans
+        WHERE SpanType = 'llm_request'
+        WINDOW w AS (PARTITION BY SessionId, if(ParentSpanId = '', SpanId, ParentSpanId)
+                     ORDER BY Timestamp, SpanId
+                     ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)

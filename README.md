@@ -33,8 +33,8 @@ Three stages, cheapest first. It checks the label encoding without touching the 
 It sends a synthetic trace, metric and log through the collector and waits for all four
 sinks to hand them back. Then it runs a real one-prompt session through the launcher and
 waits for that session in the same four — plus a Jaeger tag search on the labels it was
-launched with, and a ClickHouse row whose promoted columns are populated rather than
-merely present.
+launched with, a ClickHouse row whose promoted columns are populated rather than merely
+present, and the tokens that session spent being attributable to the tool call it made.
 
 Each stage picks a session id before it emits anything and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still
@@ -167,9 +167,10 @@ PrettyCompact` for reading or leaving the default tab-separated for piping.
 
 ```bash
 ./ct sql "SELECT toYYYYMM(Timestamp) AS month,
-                 sum(InputTokens + OutputTokens) AS billed
+                 uniq(SessionId)     AS sessions,
+                 sum(OutputTokens)   AS written
           FROM claude.spans
-          WHERE SpanType = 'llm_request' AND StopReason = 'tool_use'
+          WHERE SpanType = 'llm_request'
           GROUP BY 1 ORDER BY 1 FORMAT PrettyCompact"
 ```
 
@@ -223,14 +224,50 @@ rediscover it:
 When the *kind* doesn't matter, skip the join: `RequestContext` reads `tool` on a
 subagent's own requests and `interaction` on the main agent's.
 
-One question that looks easier than it is: **tokens spent on tool usage** has no
-structural answer. Tokens live on `llm_request` spans and tools live on `tool` spans, and
-they are siblings, not parent and child — nothing links a token count to a tool call. You
-can count the requests that ended in `stop_reason = 'tool_use'`, which is what it cost to
-*decide* to call a tool, or you can also count the following request, which is where the
-tool's output gets paid for. The second is where the money is: a tool returning 40 KB is
-billed on the next request, not its own. Pick deliberately and write the definition next
-to the query.
+### Tokens spent on tool usage, in a named month
+
+```bash
+./ct sql "SELECT sum(TotalTokens)                   AS all_tokens,
+                 sumIf(TotalTokens, ServesToolCall) AS tool_tokens,
+                 sum(ToolResultTokens)              AS tool_output
+          FROM claude.llm_requests
+          WHERE toYYYYMM(Timestamp) = 202603 FORMAT Vertical"
+```
+
+Expect `tool_tokens` to come back as nearly all of `all_tokens`. That is the answer, not a
+bug: an agentic session *is* a tool loop, and almost every request in one either called a
+tool or read what a tool returned. The measured figures, and how big a sample they rest on,
+are in [docs/analytics-findings.md](docs/analytics-findings.md).
+
+The question needs a definition and not just a query, because the spans don't contain the
+link. Tokens live on `llm_request` spans, tools live on `tool` spans, and the two are
+siblings under an interaction — nothing joins a token count to a tool call. What connects
+them is the order requests arrive in. A request ending in `stop_reason = 'tool_use'` is the
+model deciding to call a tool, and the request after it under the same parent is the one
+carrying that tool's output back into context. The second is where the money is: a tool
+returning 40 KB is billed on the following request, not its own.
+
+So `claude.llm_requests` counts a request as serving a tool call when it did any of three
+things — decided to call one (`EndedInToolCall`), carried one's result
+(`CarriesToolResult`), or ran inside one (`RequestContext = 'tool'`, which is a subagent).
+It's a union over requests rather than a sum over tool calls, so a request that did all
+three is still counted once and `tool_tokens` can never exceed `all_tokens`. All three
+clauses stay visible as their own columns, so you can always take the union back apart.
+
+`ToolResultTokens` is the smaller, sharper number underneath: how far the context grew
+beyond what the model itself wrote, which is the tool's output measured in tokens. It lands
+a couple of orders of magnitude below `tool_tokens` — a fraction of one percent of the
+bill. Both numbers are true and they answer different questions: tools *cause* nearly all
+the spend, and tool output *is* nearly none of it. Everything between the two is context
+getting re-read on every turn of the loop.
+
+The view carries the rest of the request-level columns too (`Model`, `Repository`,
+`Duration`, the four raw token counts), so the next question is usually a `GROUP BY` away
+rather than a new definition. The definition itself lives in `config/clickhouse.yaml`, and
+`ct verify` re-checks the pairing on every run, because this is the piece that fails
+quietly. A renamed `stop_reason` would take out two of the three clauses; the third reads a
+different attribute entirely and would go on marking every subagent request, so the number
+comes back a large, plausible undercount rather than an obvious zero.
 
 ## What gets recorded
 
@@ -282,8 +319,11 @@ with no repo and no branch on them.
 **No `claude-code` service in the Jaeger dropdown.** Spans are a beta feature gated on
 `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, which `./ct env` sets. If they still don't
 arrive, your build or account may not have it — verified working on Claude Code 2.1.226.
-Run `./ct verify`: if stages 1 and 2 pass and stage 3 fails, the stack is fine and the
-problem is on Claude's side.
+Run `./ct verify`: if stages 1 and 2 pass and stage 3 fails to find the session in any
+sink at all, the stack is fine and the problem is on Claude's side. A stage 3 that finds
+the session and then fails on one of its later assertions is the opposite situation —
+spans are arriving in a shape this repo no longer expects, and the message names the file
+to edit.
 
 **Spans arrive with no repo or branch on them.** They were emitted by a `claude` that
 didn't go through `./ct claude` — a shell that sourced `./ct env`, or the settings.json
