@@ -51,6 +51,15 @@ CT_CLICKHOUSE_TABLE=spans
 # query; here, the `ct verify` assertion that queries this view by name.
 CT_CLICKHOUSE_REQUESTS_VIEW=llm_requests
 
+# The rate table the request view multiplies token counts against to get dollars.
+# Named here on the same terms as the view above -- nothing is configured from
+# it, config/clickhouse.yaml still holds the authoritative CREATE VIEW, and the
+# `ct verify` assertion that names it is what would fail loudly if the two ever
+# disagreed. It is spelled out here rather than inline because the check that
+# fires when a model has no rate has to tell you where to add one, and a path in
+# an error message is the last place a stale name should be discovered.
+CT_CLICKHOUSE_PRICES_VIEW=model_prices
+
 # How long spans survive on disk before badger expires them.
 #
 # ClickHouse's own retention is not here, and deliberately: it is a TTL clause
@@ -67,6 +76,7 @@ export CT_JAEGER_OTLP_PORT CT_JAEGER_UI_PORT CT_JAEGER_HEALTH_PORT
 export CT_JAEGER_TELEMETRY_PORT CT_TRACE_TTL
 export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
 export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_REQUESTS_VIEW
+export CT_CLICKHOUSE_PRICES_VIEW
 
 # --- pinned tool releases ---------------------------------------------------
 CT_JAEGER_VERSION=2.20.0

@@ -261,6 +261,54 @@ bill. Both numbers are true and they answer different questions: tools *cause* n
 the spend, and tool output *is* nearly none of it. Everything between the two is context
 getting re-read on every turn of the loop.
 
+### The same question in dollars
+
+```bash
+./ct sql "SELECT round(sum(CostUSD), 2)                   AS all_usd,
+                 round(sumIf(CostUSD, ServesToolCall), 2) AS tool_usd
+          FROM claude.llm_requests
+          WHERE toYYYYMM(Timestamp) = 202603 FORMAT Vertical"
+```
+
+One rule matters more than the rest: **never multiply `TotalTokens` by a price.** The four
+token counts bill at rates spanning a factor of fifty, and the mix is lopsided enough that
+a blended rate comes out wrong by a large factor rather than a small one. `CostUSD`
+multiplies each count by its own rate and sums the four, so use it and the trap never
+comes up.
+
+The components stay beside it — `InputCostUSD`, `CacheReadCostUSD`,
+`CacheCreationCostUSD`, `OutputCostUSD` — because "cache reads or output?" is the usual
+next question, and because each one's share of the bill is nothing like its share of the
+tokens. Measured on this store, cache reads are 97.5% of tokens and 61.5% of spend, cache
+creation 2.1% of tokens and 26.7% of spend, output 0.4% of tokens and 11.6% of spend. The
+cheap component dominates the token count while the two expensive ones dominate the bill,
+which is exactly the structure a single blended rate erases.
+
+No span carries a cost, so these are derived — token counts times `claude.model_prices`,
+which is a rate table this repo owns and states in `config/clickhouse.yaml`. That has three
+consequences worth knowing before you trust a figure:
+
+- **History is costable.** Dollars go back as far as the tokens do, so a price landing
+  today doesn't leave last month unanswerable. Prices carry an `EffectiveFrom` date and the
+  join asks for the rate in force at each request's own timestamp, so adding tomorrow's
+  price is appending a row and last month's answer doesn't move.
+- **An unknown model costs nothing, loudly.** A model missing from the rate table gets
+  zeros, and zero dollars looks exactly like a free request. The `Priced` column separates
+  those two, and `ct verify` fails when any request in its probe session comes back
+  unpriced. If a new model appears, verify says so and you add a row.
+- **The rates were measured, not looked up.** Claude Code publishes its own cost counter on
+  `:8889`, computed independently, and every rate in the table was reconciled against it to
+  the last decimal. That includes one surprise — `claude-opus-5[1m]` carries no long-context
+  premium — and one caveat: cache creation bills at 2× input because of the one-hour cache
+  TTL, which no span records. [docs/analytics-findings.md](docs/analytics-findings.md) has
+  the procedure, so a future price change can be re-measured rather than guessed.
+
+`claude.subagent_requests` carries the same cost columns, so "which kind of subagent is
+expensive" is a `GROUP BY SubagentType` on `sum(CostUSD)`. It gets them by selecting from
+`claude.llm_requests` rather than from the span table, which keeps the money arithmetic in
+one place: a subagent's cost is whatever its requests already cost, never a second
+multiplication that could drift from the first.
+
 The view carries the rest of the request-level columns too (`Model`, `Repository`,
 `Duration`, the four raw token counts), so the next question is usually a `GROUP BY` away
 rather than a new definition. The definition itself lives in `config/clickhouse.yaml`, and

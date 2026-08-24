@@ -566,10 +566,45 @@ verify_claude() {
   parent with its neighbours, is the definition in config/clickhouse.yaml going stale."
 
   ct_ok "  tokens are attributable to tool usage: the request pairing holds"
+
+  # [LAW:verifiable-goals] Tokens being attributable is not the goal either; the
+  # question is asked in dollars, and dollars are the one column here that no
+  # span carries. They are derived -- token counts times a rate table this repo
+  # owns -- so they fail in a direction nothing else would notice: a model whose
+  # name changes stops matching the rate table, its four rates come back as
+  # zeros, and its requests cost exactly nothing. Nothing errors, no row goes
+  # missing, and the monthly total simply shrinks.
+  #
+  # So the assertion is over the whole probe session rather than one row of it,
+  # and it has to hold both ways at once: every request priced, and the total
+  # actually positive. Split into two checks, the first could pass on a session
+  # that had somehow priced nothing; the second could pass while a second model
+  # slipped through unpriced beside a working one. HAVING with no GROUP BY is
+  # what lets one query carry both -- it answers with a row when the session is
+  # wholly priced and wholly non-zero, and with nothing at all otherwise, which
+  # is the shape every other sink check here already speaks.
+  ct_poll_until "$SINK_TIMEOUT_SECONDS" clickhouse_returns_a_row \
+    "SELECT sum(CostUSD) AS Spend
+       FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW
+      WHERE SessionId = '$needle'
+     HAVING countIf(NOT Priced) = 0 AND Spend > 0" \
+    || ct_die "the probe session's requests are in
+  $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW, but they do not all carry a
+  price. A model missing from $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW costs
+  zero dollars rather than raising anything, so this is the check that says so.
+  Name the model that is missing a rate:
+    ./ct sql \"SELECT DISTINCT Model, Priced FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE SessionId = '$needle' FORMAT PrettyCompact\"
+  Then add a row for it to $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW in
+  config/clickhouse.yaml, where that view is created. That
+  file also records how the existing rates were measured against Claude Code's own
+  cost counter, which is how a new one should be established rather than guessed."
+
+  ct_ok "  every request is priced, and the session has a dollar cost"
   echo
   ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
   ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
   ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
+  ct_trace "./ct sql \"SELECT round(sumIf(CostUSD, ServesToolCall), 2) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
 }
 
 cmd_verify() {
