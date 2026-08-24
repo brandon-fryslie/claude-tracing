@@ -23,7 +23,7 @@ no git branch, no ticket, no notion of what the session was for.
 
 | Question | Answerable from today's spans? | Missing |
 | --- | --- | --- |
-| Tokens on tool usage in March | Yes | — |
+| Tokens on tool usage in March | **Answered** — `claude.llm_requests`, below | — |
 | Where tokens go past 400k context | Yes | — |
 | Avg turns to complete a ticket | **Not yet** | which ticket, and whether it completed |
 | Opus 5 vs 4.8 review convergence | **Not yet** | what marks a session as a review |
@@ -167,21 +167,50 @@ only versioned macOS build is a GitHub release asset (`clickhouse-macos-aarch64`
 rewrites itself from 161 MB to 855 MB the first time it runs, so its installed hash never
 matches what was downloaded.
 
-### One question that's harder than it looks
+### One question that's harder than it looks, and how it was settled
 
 "Tokens spent on tool usage" has no structural answer. Tokens live on `llm_request` spans,
 tools live on `tool` spans, and they are **siblings** under an interaction — not parent and
-child. Nothing links a token count to a tool call.
+child. Nothing links a token count to a tool call. What does link them is the *order* of
+requests, so the answer is a window over the request sequence rather than a join.
 
-Two defensible readings, and they give different numbers:
+Settled 2026-08-23 as the `claude.llm_requests` view. A request serves a tool call when it
+**decided** to make one (`stop_reason='tool_use'`), **carried** one's result (it follows a
+`tool_use` request under the same parent span), or **ran inside** one
+(`llm_request.context='tool'`, a subagent). It's a union over requests, not a sum over tool
+calls: a request meeting all three clauses is counted once, so the figure can't exceed the
+month's total. Every later question inherits this.
 
-- tokens of requests that ended in `stop_reason=tool_use` — what it cost to *decide* to
-  call a tool
-- plus tokens of the *following* request, which carries the tool result back into context
+Two numbers come out of it, and both are worth reporting because they disagree by two
+orders of magnitude:
 
-The second is where the money is: a tool returning 40 KB of output is paid for on the next
-request, not its own. Pick deliberately and write the definition next to the query — every
-later question inherits it.
+| Measure | What it counts | Observed |
+| --- | --- | --- |
+| `sumIf(TotalTokens, ServesToolCall)` | every billed token on a request that serves a tool call | **97.8%** of all tokens |
+| `sum(ToolResultTokens)` | context growth beyond what the model itself wrote — the tool output itself | **0.8%** of all tokens |
+
+Tools *cause* almost all the spend; tool output *is* almost none of it. The gap is context
+being re-read on every turn of the loop, which the raw counts make plain: 18.4M cache-read
+tokens against 246 fresh input tokens.
+
+Three findings from building it, none of which were predictable from the span schema:
+
+- **Requests partition by session *and* parent span, and a missing parent falls back to the
+  row's own span id.** Main-agent requests hang off their `interaction` span, a subagent's
+  off the `tool.execution` that spawned it, and `standalone` requests (title generation) off
+  nothing at all. Both halves of that key were paid for: partitioning by session alone pairs
+  a subagent's request with the main agent's previous one, measured at −7,393 on a real
+  session; and partitioning on an empty `ParentSpanId` directly files every parentless
+  request in a session under one window, which chains two unrelated standalone requests and
+  attributes −29,600 tokens to a tool call that never happened. An absent parent is not a
+  parent they share, so it cannot be a group.
+- **The context arithmetic is exact.** `ContextTokens(n+1) − ContextTokens(n) −
+  OutputTokens(n)` was positive on all 124 consecutive pairs where the predecessor ended in
+  `tool_use` (min 12, median 233, max 19,903). It is left signed rather than clamped, so a
+  negative one — a context rewritten mid-interaction — surfaces instead of vanishing.
+- **A `LowCardinality(String)` comparison yields `LowCardinality(UInt8)`,** which ClickHouse
+  refuses to store as a column. Any boolean derived from `StopReason` needs an explicit
+  `CAST(… AS Bool)`.
 
 ## Confidence: measured, derived, assumed
 
@@ -201,6 +230,9 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | `agent_id` on llm_request, `subagent_type` on the Agent tool span | **Measured** — traced session spawning a subagent, 2026-08-23 |
 | `parent_agent_id` exists at all | **Unmeasured** — never seen in this stack's data; the column is empty |
 | ClickHouse self-extracts on first run | **Measured** — 161 MB downloaded, 855 MB after one `--version` |
+| Context delta after a `tool_use` request is always positive | **Measured** — all 124 consecutive pairs in the store, none negative |
+| Tool usage is 97.8% of tokens, tool output 0.8% | **Measured** — but on 145 requests from one day, not a month; re-run before quoting |
+| Subagent requests parent to `tool.execution`, not to `interaction` | **Measured** — hand-checked against session `c11da405` |
 
 The encoding result is worth stating on its own, because its failure mode is invisible.
 Two runs of the same prompt, one variable changed:
