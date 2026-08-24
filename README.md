@@ -33,8 +33,8 @@ Three stages, cheapest first. It checks the label encoding without touching the 
 It sends a synthetic trace, metric and log through the collector and waits for all four
 sinks to hand them back. Then it runs a real one-prompt session through the launcher and
 waits for that session in the same four — plus a Jaeger tag search on the labels it was
-launched with, and a ClickHouse row whose promoted columns are populated rather than
-merely present.
+launched with, a ClickHouse row whose promoted columns are populated rather than merely
+present, and the tokens that session spent being attributable to the tool call it made.
 
 Each stage picks a session id before it emits anything and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still
@@ -319,8 +319,11 @@ with no repo and no branch on them.
 **No `claude-code` service in the Jaeger dropdown.** Spans are a beta feature gated on
 `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, which `./ct env` sets. If they still don't
 arrive, your build or account may not have it — verified working on Claude Code 2.1.226.
-Run `./ct verify`: if stages 1 and 2 pass and stage 3 fails, the stack is fine and the
-problem is on Claude's side.
+Run `./ct verify`: if stages 1 and 2 pass and stage 3 fails to find the session in any
+sink at all, the stack is fine and the problem is on Claude's side. A stage 3 that finds
+the session and then fails on one of its later assertions is the opposite situation —
+spans are arriving in a shape this repo no longer expects, and the message names the file
+to edit.
 
 **Spans arrive with no repo or branch on them.** They were emitted by a `claude` that
 didn't go through `./ct claude` — a shell that sourced `./ct env`, or the settings.json
