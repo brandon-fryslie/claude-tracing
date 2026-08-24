@@ -241,9 +241,11 @@ startup_scripts:
     # labelled identically to `claude_code_token_usage_tokens_total` apart from a
     # `type` label. Matching the two on every other label gives, per series, a
     # dollar figure and the four token counts behind it -- and the rates fall
-    # out. Every observed series reproduced to the last decimal. The procedure,
-    # and the trap that the counter is a decaying window rather than a ledger,
-    # are written up in docs/analytics-findings.md.
+    # out. Every observed series reproduced, to the limit of what the counter can
+    # express: it is serialised as a float64, so it reports 2.6423449999999997
+    # where the true figure is 2.642345, and the decimal computed here is the
+    # more exact of the two. The procedure, and the trap that the counter is a
+    # decaying window rather than a ledger, are in docs/analytics-findings.md.
     #
     # Model is matched exactly, suffix and all. `claude-opus-5[1m]` is a routing
     # identifier rather than a price tier -- measured, it bills at plain Opus 5
@@ -265,9 +267,40 @@ startup_scripts:
     # how the client is configured. The measured multiplier is 2x, Claude Code's
     # one-hour TTL, and re-running the procedure above is what catches it
     # changing.
+    # The rates are written per MILLION tokens, the unit every price list quotes,
+    # and the view also exposes each one per single token. That second set is not
+    # a convenience: it is where the scale is chosen, and choosing it in the
+    # wrong place silently truncates money.
+    #
+    # A rate carries 6 decimal places, so a rate divided by a million needs 12 to
+    # stay exact. ClickHouse gives a decimal division the scale of its left
+    # operand, which makes the order of operations load-bearing. Multiplying
+    # first and dividing after -- `tokens * ratePerMTok / 1000000` -- divides a
+    # scale-6 product and truncates the answer back to 6 places: a real
+    # 0.2605975 stores as 0.260597, and one Haiku cache-read token, at
+    # $0.0000001, stores as zero. Truncation, not rounding, so every request
+    # under-reports and a month's total drifts one way only. Dividing the rate
+    # first, at scale 12, keeps both exact.
+    #
+    # Decimal(18,12) tops out near $1,000,000, which no single request
+    # approaches, and `sum()` promotes to Decimal(38,12), so totals have room
+    # regardless. [LAW:one-source-of-truth] the conversion is stated once here
+    # rather than at each of the four multiplications downstream, which is also
+    # what keeps those four readable as plain tokens-times-rate.
     - query: |
         CREATE OR REPLACE VIEW claude.model_prices AS
-        SELECT * FROM values(
+        SELECT
+          Model,
+          EffectiveFrom,
+          InputUSDPerMTok,
+          CacheReadUSDPerMTok,
+          CacheCreationUSDPerMTok,
+          OutputUSDPerMTok,
+          toDecimal64(InputUSDPerMTok, 12)         / 1000000 AS InputUSDPerToken,
+          toDecimal64(CacheReadUSDPerMTok, 12)     / 1000000 AS CacheReadUSDPerToken,
+          toDecimal64(CacheCreationUSDPerMTok, 12) / 1000000 AS CacheCreationUSDPerToken,
+          toDecimal64(OutputUSDPerMTok, 12)        / 1000000 AS OutputUSDPerToken
+        FROM values(
           'Model String,
            EffectiveFrom Date,
            InputUSDPerMTok Decimal64(6),
@@ -358,10 +391,12 @@ startup_scripts:
     # nothing, forever, and the monthly total would just quietly shrink.
     # [LAW:parse-dont-validate]
     #
-    # Decimal64(6) rather than Float64 because this is money: a sixth decimal
-    # place is a ten-thousandth of a cent, small enough for one Haiku cache-read
-    # token, and decimal addition over a year of requests does not drift the way
-    # repeated binary-float addition does.
+    # Decimal rather than Float64 because this is money, and decimal addition
+    # over a year of requests does not drift the way repeated binary-float
+    # addition does. The four multiplications below read as plain
+    # tokens-times-rate because the per-token rates they use already carry the
+    # scale that keeps them exact; the reasoning behind that scale, and the
+    # truncation it exists to prevent, is with the prices in model_prices above.
     - query: |
         CREATE OR REPLACE VIEW claude.llm_requests AS
         SELECT
@@ -398,10 +433,10 @@ startup_scripts:
           -- mean "unknown", not "free".
           CAST(price.Model != '' AS Bool) AS Priced,
 
-          toDecimal64(InputTokens, 0)         * price.InputUSDPerMTok         / 1000000 AS InputCostUSD,
-          toDecimal64(CacheReadTokens, 0)     * price.CacheReadUSDPerMTok     / 1000000 AS CacheReadCostUSD,
-          toDecimal64(CacheCreationTokens, 0) * price.CacheCreationUSDPerMTok / 1000000 AS CacheCreationCostUSD,
-          toDecimal64(OutputTokens, 0)        * price.OutputUSDPerMTok        / 1000000 AS OutputCostUSD,
+          toDecimal64(InputTokens, 0)         * price.InputUSDPerToken         AS InputCostUSD,
+          toDecimal64(CacheReadTokens, 0)     * price.CacheReadUSDPerToken     AS CacheReadCostUSD,
+          toDecimal64(CacheCreationTokens, 0) * price.CacheCreationUSDPerToken AS CacheCreationCostUSD,
+          toDecimal64(OutputTokens, 0)        * price.OutputUSDPerToken        AS OutputCostUSD,
           InputCostUSD + CacheReadCostUSD
             + CacheCreationCostUSD + OutputCostUSD AS CostUSD,
 
@@ -451,10 +486,19 @@ startup_scripts:
     # would mean joining the price table a second time and writing the four
     # multiplications out again, two copies to keep in step forever. Selecting the
     # priced view instead means the money arithmetic exists in exactly one place
-    # and a subagent's cost is whatever its requests already cost. It is also one
-    # scan cheaper than the three-way span join it replaces, and the request-level
-    # columns it now inherits -- ServesToolCall, StopReason -- are the same facts
-    # they are one view up. [LAW:one-source-of-truth]
+    # and a subagent's cost is whatever its requests already cost.
+    # [LAW:one-source-of-truth]
+    #
+    # It is not cheaper to run, and the columns it selects are the whole of what
+    # it offers. A plain view is expanded at query time rather than materialised,
+    # so this reads claude.spans three times exactly as the direct join did --
+    # once inside llm_requests, once per hop -- with the ASOF join added on top.
+    # The reason to select from the view is that the arithmetic is written once,
+    # which is a correctness argument and does not need a performance one.
+    # `ServesToolCall` is deliberately not carried through: it is true for every
+    # row here by construction, since `RequestContext = 'tool'` is one of its
+    # three clauses and this view filters on precisely that, so exposing it would
+    # be a column that answers the same way forever.
     #
     # Ordering here is load-bearing, which is why this block sits last: a view is
     # validated against its sources when it is created, so llm_requests must

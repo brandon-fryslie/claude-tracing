@@ -250,14 +250,23 @@ same quantity, which makes it exactly the right thing to check the rate table ag
 Both metrics carry identical labels apart from a `type` label on the token counter, so
 matching them on every other label yields, per series, a dollar figure and the four
 token counts behind it. Solving those gives the rates. Measured 2026-08-23 across every
-series the endpoint exposed, each reproduced to the last decimal place:
+series the endpoint exposed, and each reproduced as closely as the counter can state
+itself — it is serialised as a float64, so one series reads `2.6423449999999997` where
+the true figure is `2.642345`, a 3×10⁻¹⁶ gap that is the counter's rounding rather than
+the table's error. Computed in decimal here, the derived figure is the more exact of the
+two. What the reconciliation returned **on that date**, per million tokens:
 
 | Model | Input | Cache read | Cache creation | Output |
 | --- | --- | --- | --- | --- |
 | `claude-opus-5[1m]` | $5.00 | $0.50 | $10.00 | $25.00 |
 | `claude-haiku-4-5-20251001` | $1.00 | $0.10 | $2.00 | $5.00 |
 
-Per million tokens. Three findings came out of the exercise:
+That is a measurement, not a price list — frozen here the way every other figure in this
+document is frozen. The rates actually applied to queries live in
+`config/clickhouse.yaml`, which is the only file that governs billed dollars; if the two
+ever disagree, this table is the stale one and the script below is how to settle it.
+
+Three findings came out of the exercise:
 
 - **`[1m]` is a routing identifier, not a price tier.** `claude-opus-5[1m]` bills at
   plain Opus 5 rates with no long-context premium. Assuming a premium would have
@@ -409,6 +418,53 @@ Once there is a real month in ClickHouse, this settles the 150–400 MB/year est
           WHERE database = 'claude' AND table = 'spans' AND active
           GROUP BY partition ORDER BY partition FORMAT PrettyCompact"
 ```
+
+Per-token rates, reconciled against Claude Code's own cost counter. This is the one
+measurement here that decides billed dollars, so it is the one most worth re-running
+rather than trusting — after a suspected price change, or when `ct verify` reports an
+unpriced model and a rate has to be established for it.
+
+It reads the live scrape surface, so **the stack must be up and a session must have run
+within the last few minutes** — series vanish after `metric_expiration`. Each series is
+checked independently; a series is only meaningful if its cost and token counters were
+scraped together, which is why nothing here sums across label sets.
+
+```bash
+curl -fsS http://127.0.0.1:8889/metrics > /tmp/ct-metrics.txt && python3 -c "
+import re, sys, collections
+from decimal import Decimal, getcontext
+getcontext().prec = 50
+# The rates under test. Copy these from config/clickhouse.yaml, then see if they hold.
+RATE = {
+ 'claude-opus-5[1m]':         dict(input='5.0', cacheRead='0.5', cacheCreation='10.0', output='25.0'),
+ 'claude-haiku-4-5-20251001': dict(input='1.0', cacheRead='0.1', cacheCreation='2.0',  output='5.0'),
+}
+cost, toks = {}, collections.defaultdict(dict)
+for line in open('/tmp/ct-metrics.txt'):
+    m = re.match(r'^claude_code_(cost_usage_USD|token_usage_tokens)_total\{(.*)\} (\S+)$', line.strip())
+    if not m: continue
+    kind, labels, val = m.group(1), m.group(2), Decimal(m.group(3))
+    d = dict(re.findall(r'(\w+)=\"([^\"]*)\"', labels))
+    ttype = d.pop('type', None)          # the only label that differs between the two metrics
+    key = tuple(sorted(d.items()))       # so everything else identifies one series
+    if kind == 'cost_usage_USD': cost[key] = max(cost.get(key, Decimal(0)), val)
+    else: toks[key][ttype] = max(toks[key].get(ttype, Decimal(0)), val)
+for key, usd in sorted(cost.items(), key=lambda kv: -kv[1]):
+    model = dict(key)['model']
+    if model not in RATE: print(f'{model:<28} NO RATE UNDER TEST -- solve for it'); continue
+    t = toks.get(key, {})
+    derived = sum((t.get(k, Decimal(0)) * Decimal(RATE[model][k]) / 1000000 for k in RATE[model]), Decimal(0))
+    diff = derived - usd
+    # The counter is a float64 and cannot state its own values exactly, so a residual
+    # around 1e-16 is its rounding. Anything larger is a rate that no longer holds.
+    print(f'{model:<28} counter={usd:<22} derived={derived:<22} {\"OK\" if abs(diff) < Decimal(\"1e-12\") else f\"MISMATCH {diff:+}\"}')
+"
+```
+
+A model printing `NO RATE UNDER TEST` is one to solve for: three of its four rates are
+published list prices (input, output, and cache read at a tenth of input), so multiply
+those out, subtract from the counter, and divide the remainder by the cache-creation
+tokens to get the last one.
 
 ## Where this is tracked
 

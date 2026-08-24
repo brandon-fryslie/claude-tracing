@@ -313,6 +313,20 @@ jaeger_traces_tagged() {
   jaeger_api "traces?service=$service&lookback=1h&tags=$(ct_percent_encode "{$tags}")"
 }
 
+# The models in a session that have no rate on file, as a readable list.
+#
+# Read in the failure path of the pricing assertion, so that the message can name
+# what is missing instead of handing over a query to run. Which model a session
+# uses is Claude Code's choice, not this stack's, so "which one has no rate" is
+# the first thing anyone hitting that failure needs and the one thing the
+# assertion itself cannot say -- it only knows that something did.
+ct_unpriced_models() {
+  ct_clickhouse "SELECT DISTINCT Model
+                   FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW
+                  WHERE SessionId = '$1' AND NOT Priced
+                  FORMAT TSV" | paste -sd' ' -
+}
+
 # True when the query returns any row at all, so the query must select rows and
 # not count them: an aggregate answers '0' to a question with no matches, which
 # is a non-empty answer meaning nothing arrived -- exactly the answer-shaped void
@@ -588,16 +602,21 @@ verify_claude() {
        FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW
       WHERE SessionId = '$needle'
      HAVING countIf(NOT Priced) = 0 AND Spend > 0" \
-    || ct_die "the probe session's requests are in
-  $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW, but they do not all carry a
-  price. A model missing from $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW costs
-  zero dollars rather than raising anything, so this is the check that says so.
-  Name the model that is missing a rate:
-    ./ct sql \"SELECT DISTINCT Model, Priced FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE SessionId = '$needle' FORMAT PrettyCompact\"
-  Then add a row for it to $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW in
-  config/clickhouse.yaml, where that view is created. That
-  file also records how the existing rates were measured against Claude Code's own
-  cost counter, which is how a new one should be established rather than guessed."
+    || ct_die "this session's requests have no price: $(ct_unpriced_models "$needle")
+
+  That is a gap in the rate table, not a broken pipeline -- the spans arrived and the
+  columns are populated, there is just no rate on file for the model that produced them.
+  Claude Code picks the model, so a session run on anything absent from
+  $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW lands here.
+
+  Add a row for it in config/clickhouse.yaml, where that view is created. Measure the
+  rate rather than copying a published one: the file records the procedure, and the two
+  surprises it has already turned up -- a suffixed model that carries no premium, and a
+  cache-creation rate set by the client's cache TTL -- are both cases where the measured
+  figure was not the documented one.
+
+  Left unpriced, those requests would cost exactly zero dollars and raise nothing, which
+  is the failure this check exists to make loud rather than the one it is reporting."
 
   ct_ok "  every request is priced, and the session has a dollar cost"
   echo

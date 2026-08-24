@@ -52,12 +52,18 @@ CT_CLICKHOUSE_TABLE=spans
 CT_CLICKHOUSE_REQUESTS_VIEW=llm_requests
 
 # The rate table the request view multiplies token counts against to get dollars.
-# Named here on the same terms as the view above -- nothing is configured from
-# it, config/clickhouse.yaml still holds the authoritative CREATE VIEW, and the
-# `ct verify` assertion that names it is what would fail loudly if the two ever
-# disagreed. It is spelled out here rather than inline because the check that
-# fires when a model has no rate has to tell you where to add one, and a path in
-# an error message is the last place a stale name should be discovered.
+#
+# Unlike the two names above, this one buys no drift protection at all, and the
+# distinction is worth stating rather than glossing: those are interpolated into
+# SQL that runs, so a stale name is a query ClickHouse rejects. This appears only
+# in the text of a message, so a rename in config/clickhouse.yaml would leave the
+# guidance pointing at something that no longer exists and nothing would say so.
+#
+# It is here for one spelling of a name used in guidance, and nothing more. What
+# actually holds the name true is upstream: claude.llm_requests selects from this
+# view, so a renamed or missing price table fails CREATE VIEW at startup under
+# throw_on_error and ClickHouse never becomes ready. [LAW:single-enforcer] that
+# invariant has exactly one enforcer and does not need a second here.
 CT_CLICKHOUSE_PRICES_VIEW=model_prices
 
 # How long spans survive on disk before badger expires them.

@@ -34,7 +34,8 @@ It sends a synthetic trace, metric and log through the collector and waits for a
 sinks to hand them back. Then it runs a real one-prompt session through the launcher and
 waits for that session in the same four — plus a Jaeger tag search on the labels it was
 launched with, a ClickHouse row whose promoted columns are populated rather than merely
-present, and the tokens that session spent being attributable to the tool call it made.
+present, the tokens that session spent being attributable to the tool call it made, and
+every one of its requests carrying a price so the session has a cost in dollars.
 
 Each stage picks a session id before it emits anything and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still
@@ -279,29 +280,49 @@ comes up.
 The components stay beside it — `InputCostUSD`, `CacheReadCostUSD`,
 `CacheCreationCostUSD`, `OutputCostUSD` — because "cache reads or output?" is the usual
 next question, and because each one's share of the bill is nothing like its share of the
-tokens. Measured on this store, cache reads are 97.5% of tokens and 61.5% of spend, cache
-creation 2.1% of tokens and 26.7% of spend, output 0.4% of tokens and 11.6% of spend. The
-cheap component dominates the token count while the two expensive ones dominate the bill,
-which is exactly the structure a single blended rate erases.
+tokens. The cheapest component supplies almost all the tokens while the two dearest
+supply most of the bill, which is precisely the structure a single blended rate erases.
+Ask your own store rather than trusting a figure quoted here, because these move as data
+accumulates:
+
+```bash
+./ct sql "SELECT round(100*sum(CacheReadCostUSD)/sum(CostUSD), 1)     AS cache_read_pct_spend,
+                 round(100*sum(CacheReadTokens)/sum(TotalTokens), 1)  AS cache_read_pct_tokens,
+                 round(100*sum(OutputCostUSD)/sum(CostUSD), 1)        AS output_pct_spend,
+                 round(100*sum(OutputTokens)/sum(TotalTokens), 1)     AS output_pct_tokens
+          FROM claude.llm_requests FORMAT Vertical"
+```
 
 No span carries a cost, so these are derived — token counts times `claude.model_prices`,
 which is a rate table this repo owns and states in `config/clickhouse.yaml`. That has three
 consequences worth knowing before you trust a figure:
 
-- **History is costable.** Dollars go back as far as the tokens do, so a price landing
-  today doesn't leave last month unanswerable. Prices carry an `EffectiveFrom` date and the
-  join asks for the rate in force at each request's own timestamp, so adding tomorrow's
-  price is appending a row and last month's answer doesn't move.
+- **Cost reaches back to before cost existed.** The token counts were always on the spans,
+  so adding this feature made every session already in the store costable — which
+  capturing Anthropic's counter could never have done. What it does *not* do is backfill
+  across a price boundary: prices carry an `EffectiveFrom`, the join takes the rate in
+  force at each request's own timestamp, and a span older than the earliest matching row
+  comes back `Priced = false` rather than costed at a rate nobody checked against it.
+  Adding tomorrow's price leaves last month's answer untouched; reaching further back
+  means adding a row dated early enough, which is a claim about a past price you should be
+  able to stand behind.
 - **An unknown model costs nothing, loudly.** A model missing from the rate table gets
   zeros, and zero dollars looks exactly like a free request. The `Priced` column separates
   those two, and `ct verify` fails when any request in its probe session comes back
-  unpriced. If a new model appears, verify says so and you add a row.
+  unpriced, naming the model. Expect this the first time you run a model that isn't in the
+  table — Claude Code picks the model, so the table can only cover what has been measured.
+  Adding one is the maintenance step, and measuring its rate rather than copying a
+  published one is the point: both surprises so far (a suffixed model carrying no premium,
+  a cache rate set by the client's cache TTL) were cases where the measured figure and the
+  documented one disagreed.
 - **The rates were measured, not looked up.** Claude Code publishes its own cost counter on
-  `:8889`, computed independently, and every rate in the table was reconciled against it to
-  the last decimal. That includes one surprise — `claude-opus-5[1m]` carries no long-context
-  premium — and one caveat: cache creation bills at 2× input because of the one-hour cache
-  TTL, which no span records. [docs/analytics-findings.md](docs/analytics-findings.md) has
-  the procedure, so a future price change can be re-measured rather than guessed.
+  `:8889`, computed independently, and every rate here was reconciled against it — to the
+  limit of what that counter can state, since it is emitted as a float and the decimal
+  computed here is the more exact of the two. The reconciliation turned up one surprise
+  (`claude-opus-5[1m]` carries no long-context premium) and one caveat (cache creation
+  bills at 2× input because of the one-hour cache TTL, which no span records).
+  [docs/analytics-findings.md](docs/analytics-findings.md) has the procedure, so a future
+  price change can be re-measured rather than guessed.
 
 `claude.subagent_requests` carries the same cost columns, so "which kind of subagent is
 expensive" is a `GROUP BY SubagentType` on `sum(CostUSD)`. It gets them by selecting from
