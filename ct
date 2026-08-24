@@ -536,9 +536,12 @@ verify_claude() {
   # either; the tool-cost definition built on them holding is. That definition is
   # the one thing here that no sink check can catch, because it fails by going
   # quiet: it reads stop_reason and the order of requests under a parent, so a
-  # renamed value or a reparented span makes ServesToolCall uniformly false and
-  # every answer about tool spend becomes 0 -- a number shaped exactly like "you
-  # used no tools" and indistinguishable from it.
+  # renamed value or a reparented span takes out two of ServesToolCall's three
+  # clauses. Not the third -- RequestContext reads a different attribute key
+  # entirely and goes on marking every subagent request -- so what comes back is
+  # not a zero anyone would question but a large, plausible undercount. That is
+  # the harder failure to spot, not the easier one, which is the whole reason
+  # this assertion exists.
   #
   # The probe prompt forces one tool call, so this session must contain the
   # pairing the definition is made of: a request that ended in tool_use, and the
@@ -548,14 +551,15 @@ verify_claude() {
   # matched to each other correctly.
   ct_poll_until "$SINK_TIMEOUT_SECONDS" clickhouse_returns_a_row \
     "SELECT ToolResultTokens
-       FROM $CT_CLICKHOUSE_DATABASE.llm_requests
+       FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW
       WHERE SessionId = '$needle' AND ServesToolCall
         AND CarriesToolResult AND ToolResultTokens > 0 AND TotalTokens > 0
       LIMIT 1" \
-    || ct_die "the probe session made a tool call, but claude.llm_requests cannot
-  see it. The view pairs each llm_request with the one before it under the same
-  parent span; that pairing is what attributes tokens to tool usage, and nothing
-  else in this stack would notice it breaking.
+    || ct_die "the probe session made a tool call, but
+  $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW cannot see it. The view
+  pairs each llm_request with the one before it under the same parent span; that
+  pairing is what attributes tokens to tool usage, and nothing else in this stack
+  would notice it breaking.
   Compare what the probe actually emitted against what the view expects:
     ./ct sql \"SELECT Timestamp, SpanId, ParentSpanId, StopReason, RequestContext, ContextTokens, OutputTokens FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE SessionId = '$needle' AND SpanType = 'llm_request' ORDER BY Timestamp FORMAT PrettyCompact\"
   A StopReason that is no longer 'tool_use', or an llm_request no longer sharing a
@@ -565,7 +569,7 @@ verify_claude() {
   echo
   ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
   ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
-  ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.llm_requests WHERE toYYYYMM(Timestamp) = 202603\""
+  ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
 }
 
 cmd_verify() {

@@ -195,12 +195,15 @@ tokens against 246 fresh input tokens.
 
 Three findings from building it, none of which were predictable from the span schema:
 
-- **Requests partition by `(SessionId, ParentSpanId)`, never by session alone.** Main-agent
-  requests hang off their `interaction` span, a subagent's off the `tool.execution` that
-  spawned it, and `standalone` requests (title generation) off nothing. Partitioning by
-  session alone pairs a subagent's request with the main agent's previous one and yields a
-  negative context delta — measured at −7,393 on one real session before the parent was
-  added to the key.
+- **Requests partition by session *and* parent span, and a missing parent falls back to the
+  row's own span id.** Main-agent requests hang off their `interaction` span, a subagent's
+  off the `tool.execution` that spawned it, and `standalone` requests (title generation) off
+  nothing at all. Both halves of that key were paid for: partitioning by session alone pairs
+  a subagent's request with the main agent's previous one, measured at −7,393 on a real
+  session; and partitioning on an empty `ParentSpanId` directly files every parentless
+  request in a session under one window, which chains two unrelated standalone requests and
+  attributes −29,600 tokens to a tool call that never happened. An absent parent is not a
+  parent they share, so it cannot be a group.
 - **The context arithmetic is exact.** `ContextTokens(n+1) − ContextTokens(n) −
   OutputTokens(n)` was positive on all 124 consecutive pairs where the predecessor ended in
   `tool_use` (min 12, median 233, max 19,903). It is left signed rather than clamped, so a

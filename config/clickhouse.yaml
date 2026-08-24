@@ -277,6 +277,16 @@ startup_scripts:
     # off the `tool.execution` that spawned it, and `standalone` requests (title
     # generation) off nothing at all. SpanId breaks Timestamp ties so the view
     # answers the same way twice. [LAW:no-ambient-temporal-coupling]
+    #
+    # That third population is why the key falls back to SpanId. An empty
+    # ParentSpanId is not a parent they share, it is the absence of one, so
+    # partitioning on it directly would file every parentless request in a
+    # session under one window and let lagInFrame pair two requests that have
+    # nothing to do with each other. Falling back to the row's own SpanId makes
+    # each of them a partition of one: lagInFrame finds no predecessor,
+    # CarriesToolResult is false and ToolResultTokens is 0, by construction
+    # rather than by a filter every query would have to remember.
+    # [LAW:types-are-the-program]
     - query: |
         CREATE OR REPLACE VIEW claude.llm_requests AS
         SELECT
@@ -323,6 +333,6 @@ startup_scripts:
              0) AS ToolResultTokens
         FROM claude.spans
         WHERE SpanType = 'llm_request'
-        WINDOW w AS (PARTITION BY SessionId, ParentSpanId
+        WINDOW w AS (PARTITION BY SessionId, if(ParentSpanId = '', SpanId, ParentSpanId)
                      ORDER BY Timestamp, SpanId
                      ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
