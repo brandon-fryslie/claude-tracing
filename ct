@@ -313,18 +313,74 @@ jaeger_traces_tagged() {
   jaeger_api "traces?service=$service&lookback=1h&tags=$(ct_percent_encode "{$tags}")"
 }
 
-# The models in a session that have no rate on file, as a readable list.
+# Why the pricing assertion failed, as the whole message the reader should get.
 #
-# Read in the failure path of the pricing assertion, so that the message can name
-# what is missing instead of handing over a query to run. Which model a session
-# uses is Claude Code's choice, not this stack's, so "which one has no rate" is
-# the first thing anyone hitting that failure needs and the one thing the
-# assertion itself cannot say -- it only knows that something did.
-ct_unpriced_models() {
-  ct_clickhouse "SELECT DISTINCT Model
-                   FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW
-                  WHERE SessionId = '$1' AND NOT Priced
-                  FORMAT TSV" | paste -sd' ' -
+# That assertion answers with a row only when the session is wholly priced and
+# wholly non-zero, so its silence carries three different meanings: a model with
+# no rate on file, a session that genuinely cost nothing, or a store that stopped
+# answering. Each wants a different action, and this is the only place the
+# distinction can be drawn -- the assertion knows that something was wrong and
+# never which thing.
+#
+# One query, one row, no HAVING, so it always answers and the values pick the
+# message instead of the caller running a different query per case.
+# [LAW:dataflow-not-control-flow]
+#
+# The earlier version returned just the unpriced model names, which read
+# identically whether it had found none or had failed to reach ClickHouse at all
+# -- and the caller interpolated it into a sentence asserting the rate-table
+# case, so an outage arrived disguised as an empty list of missing models.
+# [LAW:parse-dont-validate] the empty string was an answer-shaped void.
+ct_price_failure_reason() {
+  local row unpriced requests spend models
+  # A plain assignment rather than `local row=...`: `local` contributes its own
+  # exit status and would mask the failure this branch exists to notice.
+  if ! row="$(ct_clickhouse "SELECT countIf(NOT Priced),
+                                    count(),
+                                    sum(CostUSD),
+                                    arrayStringConcat(groupUniqArrayIf(Model, NOT Priced), ' ')
+                               FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW
+                              WHERE SessionId = '$1' FORMAT TSV")"; then
+    printf '%s\n' \
+      "ClickHouse did not answer the diagnostic either, so the cause is not known." \
+      "  The assertion and this follow-up both failed, which points at the stack rather" \
+      "  than at the rate table. Start with ./ct status, then ./ct logs."
+    return
+  fi
+  IFS=$'\t' read -r unpriced requests spend models <<<"$row"
+
+  if [ "$requests" = 0 ]; then
+    printf '%s\n' \
+      "no request rows for this session reached $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW." \
+      "  The spans may still be in flight, or the view's definition may no longer match" \
+      "  what the session emitted. Look at the spans directly:" \
+      "    ./ct sql \"SELECT count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE SessionId = '$1'\""
+  elif [ "$unpriced" != 0 ]; then
+    printf '%s\n' \
+      "$unpriced of this session's $requests requests have no price: $models" \
+      "" \
+      "  That is a gap in the rate table, not a broken pipeline -- the spans arrived and the" \
+      "  columns are populated, there is just no rate on file for the model that produced them." \
+      "  Claude Code picks the model, so a session run on anything absent from" \
+      "  $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW lands here." \
+      "" \
+      "  Add a row for it in config/clickhouse.yaml, where that view is created. Measure the" \
+      "  rate rather than copying a published one: the file records the procedure, and the two" \
+      "  surprises it has already turned up -- a suffixed model that carries no premium, and a" \
+      "  cache-creation rate set by the client's cache TTL -- are both cases where the measured" \
+      "  figure was not the documented one." \
+      "" \
+      "  Left unpriced, those requests would cost exactly zero dollars and raise nothing, which" \
+      "  is the failure this check exists to make loud rather than the one it is reporting."
+  else
+    printf '%s\n' \
+      "every one of this session's $requests requests is priced, but they sum to \$$spend." \
+      "  So this is not a missing rate. Either the session did no billable work, or a rate" \
+      "  in $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW is itself zero." \
+      "  Which of the two it is:" \
+      "    ./ct sql \"SELECT Model, sum(TotalTokens) AS tok, sum(CostUSD) AS usd FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE SessionId = '$1' GROUP BY 1 FORMAT PrettyCompact\"" \
+      "  Tokens with no dollars is a zero rate; no tokens either is a session that did nothing."
+  fi
 }
 
 # True when the query returns any row at all, so the query must select rows and
@@ -602,21 +658,7 @@ verify_claude() {
        FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW
       WHERE SessionId = '$needle'
      HAVING countIf(NOT Priced) = 0 AND Spend > 0" \
-    || ct_die "this session's requests have no price: $(ct_unpriced_models "$needle")
-
-  That is a gap in the rate table, not a broken pipeline -- the spans arrived and the
-  columns are populated, there is just no rate on file for the model that produced them.
-  Claude Code picks the model, so a session run on anything absent from
-  $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW lands here.
-
-  Add a row for it in config/clickhouse.yaml, where that view is created. Measure the
-  rate rather than copying a published one: the file records the procedure, and the two
-  surprises it has already turned up -- a suffixed model that carries no premium, and a
-  cache-creation rate set by the client's cache TTL -- are both cases where the measured
-  figure was not the documented one.
-
-  Left unpriced, those requests would cost exactly zero dollars and raise nothing, which
-  is the failure this check exists to make loud rather than the one it is reporting."
+    || ct_die "$(ct_price_failure_reason "$needle")"
 
   ct_ok "  every request is priced, and the session has a dollar cost"
   echo
