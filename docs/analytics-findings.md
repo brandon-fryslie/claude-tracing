@@ -314,7 +314,7 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | Context delta after a `tool_use` request is always positive | **Measured** — all 124 consecutive pairs in the store, none negative |
 | Tool usage is 97.8% of tokens, tool output 0.8% | **Measured** — but on 145 requests from one day, not a month; re-run before quoting |
 | Subagent requests parent to `tool.execution`, not to `interaction` | **Measured** — hand-checked against session `c11da405` |
-| Per-MTok rates for `claude-opus-5[1m]` and Haiku 4.5 | **Measured** — every metric series reproduced exactly from tokens × rate, 2026-08-23 |
+| Per-MTok rates: all four for `claude-opus-5[1m]`, input and output for Haiku 4.5 | **Measured** — every metric series reproduced exactly from tokens × rate, 2026-08-23. Haiku's other two rates are the row below, not this one |
 | `claude-opus-5[1m]` carries no long-context price premium | **Measured** — same reconciliation; it bills at plain Opus 5 rates |
 | Cache creation bills at 2× input (the one-hour cache TTL) | **Measured** — solved from the counter; no span records the TTL, so it is a claim about this client's configuration |
 | Haiku 4.5 cache-read and cache-creation rates | **Assumed** — no Haiku request in this store has touched the cache; the published multipliers were carried over from Opus |
@@ -453,6 +453,13 @@ for key, usd in sorted(cost.items(), key=lambda kv: -kv[1]):
     model = dict(key)['model']
     if model not in RATE: print(f'{model:<28} NO RATE UNDER TEST -- solve for it'); continue
     t = toks.get(key, {})
+    # A 'type' label this script has no rate for is the failure that would otherwise
+    # pass quietly: its tokens contribute nothing, so 'derived' lands low and the
+    # residual reads as a rate that drifted rather than a bucket nobody priced. An
+    # absent label is fine -- that is a bucket the session never used -- but an
+    # unrecognised one means the export changed shape and no number below is safe.
+    unknown = sorted(set(t) - set(RATE[model]))
+    if unknown: print(f'{model:<28} UNPRICED TOKEN TYPE {unknown} -- export changed; add rates for these before trusting any figure here'); continue
     derived = sum((t.get(k, Decimal(0)) * Decimal(RATE[model][k]) / 1000000 for k in RATE[model]), Decimal(0))
     diff = derived - usd
     # The counter is a float64 and cannot state its own values exactly, so a residual
