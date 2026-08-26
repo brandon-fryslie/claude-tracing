@@ -136,16 +136,21 @@ CT_LIT_WORKSPACE="$([ -d "$CT_LIT_WORKSPACE" ] && cd "$CT_LIT_WORKSPACE" && pwd 
 # two sides agree on how patient this stack is with Dolt.
 CT_LIT_TIMEOUT_SECONDS=60
 
-# How long `ct` waits on a ClickHouse query over HTTP. Derived rather than
-# written down, because the longest thing ClickHouse can legitimately be doing
-# on our behalf is the lit export above: claude.ticket_events runs it through
-# executable(), so a bound below CT_LIT_TIMEOUT_SECONDS hangs up on a query the
-# server is still lawfully working on, and the failure then arrives as a curl
-# timeout under a die message that enumerates causes it is not.
-# [LAW:one-source-of-truth] two independently written numbers describing one
-# wait had already drifted to 30 and 60; a derived one cannot drift again.
-CT_CLICKHOUSE_WORK_SECONDS=30   # ClickHouse's own budget, on top of lit's
-CT_CLICKHOUSE_TIMEOUT_SECONDS=$(( CT_LIT_TIMEOUT_SECONDS + CT_CLICKHOUSE_WORK_SECONDS ))
+# How long `ct` waits on a ClickHouse query over HTTP. Two bounds, because
+# there are two kinds of query and one number cannot be right for both: a span
+# query talks to ClickHouse alone, while claude.ticket_events runs `lit export`
+# through executable() and so is entitled to lit's patience on top of
+# ClickHouse's own. Which one applies is a property of the query, so the caller
+# passes it rather than every caller inheriting the slowest case.
+# [LAW:dataflow-not-control-flow]
+#
+# The lit-backed bound is derived and not written down: below
+# CT_LIT_TIMEOUT_SECONDS, curl hangs up on a query the server is still lawfully
+# working on and the failure arrives as a timeout under a die message that
+# enumerates causes it is not. Two independently written numbers describing one
+# wait had already drifted to 30 and 60 once. [LAW:one-source-of-truth]
+CT_CLICKHOUSE_TIMEOUT_SECONDS=30
+CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS=$(( CT_LIT_TIMEOUT_SECONDS + CT_CLICKHOUSE_TIMEOUT_SECONDS ))
 
 # lit's history as rows, and the turn grain attributed to a ticket. The two sit
 # on opposite sides of the distinction drawn above, and are worth keeping apart
@@ -183,7 +188,7 @@ export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
 export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_REQUESTS_VIEW
 export CT_CLICKHOUSE_PRICES_VIEW CT_CLICKHOUSE_SCRIPTS_DIR
 export CT_LIT_EXPORT_SCRIPT CT_LIT_WORKSPACE CT_LIT_TIMEOUT_SECONDS
-export CT_CLICKHOUSE_TIMEOUT_SECONDS
+export CT_CLICKHOUSE_TIMEOUT_SECONDS CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS
 export CT_CLICKHOUSE_TICKET_EVENTS_VIEW CT_CLICKHOUSE_TICKET_TURNS_VIEW
 
 # --- pinned tool releases ---------------------------------------------------

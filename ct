@@ -50,8 +50,14 @@ ct_clickhouse_url() { printf 'http://127.0.0.1:%s/' "$CT_CLICKHOUSE_HTTP_PORT"; 
 
 # One query, posted rather than URL-encoded, so a query containing anything at
 # all -- quotes, newlines, percent signs -- reaches ClickHouse as written.
+#
+# The bound comes from the caller because it is a property of the query: a plain
+# span query gets CT_CLICKHOUSE_TIMEOUT_SECONDS, and only a query that reaches
+# lit through executable() is entitled to lit's patience on top of it. Sharing
+# one constant made the pricing check and the readiness polls wait three times
+# their own documented budget for a tracker they never touch.
 ct_clickhouse() {
-  curl -fsS --max-time "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_clickhouse_url)" --data-binary "$1"
+  curl -fsS --max-time "$1" "$(ct_clickhouse_url)" --data-binary "$2"
 }
 
 # The same POST without -f, so a non-2xx yields ClickHouse's own error text
@@ -63,8 +69,10 @@ ct_clickhouse() {
 # deciding anything: without -f a server error comes back as an ordinary body,
 # so a caller that used this to test something would read the error as its
 # answer. [LAW:parse-dont-validate] the deciding path is the one that can fail.
+# Same bound as the call being explained, passed the same way, so the retry can
+# never have a shorter fuse than the attempt that detected the failure.
 ct_clickhouse_error() {
-  curl -sS --max-time "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_clickhouse_url)" --data-binary "$1" 2>&1
+  curl -sS --max-time "$1" "$(ct_clickhouse_url)" --data-binary "$2" 2>&1
 }
 
 # Blocks until the service answers its readiness URL, or dies with the tail of
@@ -123,8 +131,18 @@ ct_run_bounded() {
   # `set -m` for the launch and nothing else. Without job control a background
   # job inherits ct's own process group, which makes a group signal a suicide
   # note; with it the worker leads a group of its own, so the group is both the
-  # right target and a safe one. Measured: worker pid 41127 in pgid 41127,
-  # while ct stayed in 41102 and survived the kill.
+  # right target and a safe one.
+  #
+  # The doubt worth pre-empting, because it is the right one to have: bash
+  # disables job control in subshells, and every caller reaches this through
+  # `$( )` -- ct_lit_status runs the worker inside one and is itself read inside
+  # another. If job control did not survive that, `-$worker` would name a group
+  # that does not exist, `2>/dev/null` would swallow the complaint, and the bound
+  # would be quietly gone. `set -m` issued INSIDE the substitution subshell does
+  # apply to jobs started there; measured at both depths, worker pgid equal to
+  # its own pid and never ct's, and end to end through ct_lit_status against a
+  # lit that hangs, ignores TERM and forks: returned at the bound, no survivors.
+  # bash 5.3.9. Re-measure before trusting this on another shell.
   set -m; "$@" & worker=$!; set +m
   # The GROUP, and then twice, because a bound that a worker can decline is not
   # a bound. Signalling only the leader misses whatever it forked -- lit opens a
@@ -134,11 +152,20 @@ ct_run_bounded() {
   # measured hanging indefinitely past its own bound, which is the one failure
   # its whole existence is meant to rule out. KILL cannot be trapped, so the
   # bound stops being a request. [LAW:no-ambient-temporal-coupling]
+  #
+  # The timer's own output goes to /dev/null, and that redirect is load-bearing
+  # rather than tidiness. A caller capturing this function's stdout -- which
+  # ct_lit_status does -- is waiting on the PIPE, not on the worker, so it waits
+  # until every process holding the write end has let go. Killing the timer
+  # below leaves its `sleep` orphaned still holding that end, so without this
+  # redirect a worker that succeeded instantly still blocked the caller for the
+  # entire bound: measured at 60s for a command that exited in 0s, and 0s for
+  # the identical call left uncaptured. The bound silently became the latency.
   { sleep "$seconds"
     kill -TERM -- -"$worker" 2>/dev/null
     sleep "$KILL_GRACE_SECONDS"
     kill -KILL -- -"$worker" 2>/dev/null
-  } & timer=$!
+  } >/dev/null 2>&1 & timer=$!
   # A killed worker comes back non-zero, which is the answer the caller wants:
   # a command that had to be stopped did not succeed.
   wait "$worker" 2>/dev/null && status=0 || status=$?
@@ -211,7 +238,15 @@ ct_report_service() {
 # window being narrow. Same idiom ct_install_tool uses, for the same reason.
 ct_write_lit_bridge() {
   local script="$CT_CLICKHOUSE_SCRIPTS_DIR/$CT_LIT_EXPORT_SCRIPT" staged
-  staged="$script.staging"
+  # Unique per invocation, not a fixed `.staging`. The rename protects a READER
+  # from a half-written file; a shared staging path leaves two concurrent `./ct
+  # up` runs -- two terminals, a re-entrant script, CI firing twice -- both
+  # truncating and writing the same file, and whichever `mv` lands last then
+  # publishes the interleaved result atomically. That is the same corrupt script
+  # the staging exists to prevent, moved from the reader side to the writer
+  # side, and published invisibly rather than caught. $$ is what makes the two
+  # writers not share a file. [LAW:no-ambient-temporal-coupling]
+  staged="$script.staging.$$"
   # Named here because this is the one moment the path is committed to: the
   # script below bakes it in, and every later reader is ClickHouse, whose
   # complaint arrives at query time and out of context. Loud, and deliberately
@@ -277,18 +312,47 @@ EOF
 # interpolated so a workspace path never becomes part of the script text.
 # shellcheck disable=SC2016  # $1 is for the inner bash to expand, deliberately
 ct_lit_status() {
-  local complaint
-  # No lit to ask, or nowhere to ask it about: nothing is wrong, there is just
-  # nothing here. Both arms are the same answer because they are the same fact.
-  { command -v lit >/dev/null && [ -d "$CT_LIT_WORKSPACE" ]; } \
+  local complaint status
+  # Three ways for there to be nothing here, and they are one fact: no lit to
+  # ask, nowhere to ask it about, or a workspace nobody ever ran `lit init` in.
+  #
+  # That third one is not pedantry. lit lives on developers' PATHs for other
+  # repos, and the DEFAULT workspace is this checkout -- whose store is under
+  # .git/links and so is never cloned. Without this arm, the fresh-clone
+  # Quickstart hard-fails for anyone who happens to have lit installed:
+  # `lit export` exits 1 ("links requires running inside a git repository/
+  # worktree with links initialized"), which is indistinguishable from a real
+  # breakage unless we ask first whether there was ever a store to break.
+  # Nothing ever worked here, so nothing stopped working.
+  #
+  # .git/links is lit's layout rather than ours, named here because the README
+  # and this file already document it. If lit relocates its store this check
+  # starts answering `absent` for a workspace that has one -- verify skips the
+  # join and says so, which is the pre-existing behaviour and the safe
+  # direction to be wrong in. It cannot turn into a false failure.
+  { command -v lit >/dev/null \
+      && [ -d "$CT_LIT_WORKSPACE" ] \
+      && [ -d "$CT_LIT_WORKSPACE/.git/links" ]; } \
     || { printf 'absent'; return 0; }
   # stdout dropped, stderr kept -- the export itself is not wanted here, only
   # whether producing it worked and, when it did not, what lit said about it.
   # Discarding both is what left the old version with nothing to report.
   complaint="$(ct_run_bounded "$CT_LIT_TIMEOUT_SECONDS" \
                  bash -c 'cd "$1" && lit export' _ "$CT_LIT_WORKSPACE" 2>&1 >/dev/null)" \
-    || { printf 'broken\t%s' "$complaint"; return 0; }
-  printf 'ready'
+    && status=0 || status=$?
+  # One status, three readings. A worker the bound had to kill exits 128+signal
+  # and typically says nothing before it goes, so quoting its stderr quotes a
+  # blank line at the exact moment the useful fact -- that it hung until it was
+  # killed -- is already known right here. A hang gets reported as a hang.
+  # [LAW:no-silent-failure]
+  if [ "$status" -eq 0 ]; then
+    printf 'ready'
+  elif [ "$status" -ge 128 ]; then
+    printf 'broken\tno answer within %ss; it was still running and had to be killed' \
+           "$CT_LIT_TIMEOUT_SECONDS"
+  else
+    printf 'broken\t%s' "$complaint"
+  fi
 }
 
 cmd_up() {
@@ -323,7 +387,10 @@ cmd_sql() {
   local query="$*"
   [ -n "$query" ] || ct_die "usage: ct sql <query>
   e.g.  ./ct sql \"SELECT SpanType, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
-  ct_clickhouse "$query" || ct_die "ClickHouse rejected the query, or is not up. Check: ./ct status"
+  # The lit-backed bound, because this runs whatever the user typed and the
+  # README's own worked example is a claude.ticket_turns query.
+  ct_clickhouse "$CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS" "$query" \
+    || ct_die "ClickHouse rejected the query, or is not up. Check: ./ct status"
 }
 
 cmd_logs() {
@@ -516,7 +583,7 @@ ct_price_failure_reason() {
   #
   # A plain assignment rather than `local row=...`: `local` contributes its own
   # exit status and would mask the failure this branch exists to notice.
-  if ! row="$(ct_clickhouse "SELECT countIf(NOT Priced),
+  if ! row="$(ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "SELECT countIf(NOT Priced),
                                     count(),
                                     sum(CostUSD),
                                     arrayStringConcat(groupUniqArrayIf(Model, NOT Priced), ' '),
@@ -593,7 +660,7 @@ ct_price_failure_reason() {
 # this is here to catch. [LAW:parse-dont-validate]
 clickhouse_returns_a_row() {
   local rows
-  rows="$(ct_clickhouse "$1")" || return 1
+  rows="$(ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$1")" || return 1
   [ -n "$rows" ]
 }
 
@@ -784,7 +851,7 @@ verify_ticket_join() {
                 countIf(match(SessionId, '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
            FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_EVENTS_VIEW
           FORMAT TSV"
-  counts="$(ct_clickhouse "$query")" \
+  counts="$(ct_clickhouse "$CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS" "$query")" \
     || ct_die "lit exports fine from this shell, but $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_EVENTS_VIEW could not read it.
   Known causes, and ClickHouse usually says which:
     - lit is not on the PATH of the ClickHouse process, though it is on this one
@@ -794,7 +861,7 @@ verify_ticket_join() {
   The check above probes the workspace this shell is pointed at; the query goes
   through the script the last \`./ct up\` wrote. Those are allowed to differ, and
   only the first one follows the variable.
-  $(ct_clickhouse_error "$query")"
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS" "$query")"
   IFS=$'\t' read -r events usable agent_events joinable <<< "$counts"
 
   # An initialised workspace nobody has filed a ticket in yet is a legitimate
