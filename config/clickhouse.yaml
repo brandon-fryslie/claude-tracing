@@ -382,6 +382,18 @@ startup_scripts:
     # It matches at most one row per request, so the join cannot fan out and the
     # window below still sees exactly one row per request.
     #
+    # `toDate(..., 'UTC')` is pinned rather than left to the server. Timestamp is
+    # DateTime64(9) with no timezone attached, so a bare toDate() resolves it in
+    # whatever zone the host happens to be set to, and the same nanosecond then
+    # lands on different calendar days on different machines: the instant
+    # 2026-08-23 03:00:00 UTC is 2026-08-23 in UTC and Tokyo, and 2026-08-22 in
+    # America/Denver. Either side of an EffectiveFrom boundary, that decides
+    # whether a request is priced at all -- so unpinned, one span's cost would
+    # depend on the laptop reading it. EffectiveFrom records the date a rate was
+    # verified, which is an absolute fact, so the boundary is compared in
+    # absolute time. Only the join is pinned: toYYYYMM() in a reader's own query
+    # stays local, because a reader asking for "last month" means their own.
+    #
     # LEFT, and that is the hazard: an unmatched model does not drop the row, it
     # fills the rates with zeros, and zero dollars is shaped exactly like a
     # request that was free. `Priced` is the discriminator that pulls those two
@@ -457,7 +469,7 @@ startup_scripts:
         FROM claude.spans AS request
         ASOF LEFT JOIN claude.model_prices AS price
           ON request.Model = price.Model
-         AND price.EffectiveFrom <= toDate(request.Timestamp)
+         AND price.EffectiveFrom <= toDate(request.Timestamp, 'UTC')
         WHERE SpanType = 'llm_request'
         WINDOW w AS (PARTITION BY SessionId, if(ParentSpanId = '', SpanId, ParentSpanId)
                      ORDER BY Timestamp, SpanId
