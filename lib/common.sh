@@ -113,23 +113,39 @@ CT_LIT_EXPORT_SCRIPT=lit_export.sh
 # reading of the sentence above, would silently name two different trees. One
 # string, one directory, decided once. [LAW:one-source-of-truth]
 #
-# A path that does not exist fails here and by name rather than surfacing later
-# as an empty backlog. [LAW:no-silent-failure]
-# Checked before it is resolved, and not after, so the message can still name
-# what the user actually asked for: the resolving assignment overwrites the
-# variable with the empty output of a failed `cd` before any `||` could read it.
+# Resolution only. Whether a workspace that is not there is FATAL is the
+# caller's question, not this file's, and answering it here answered it for
+# everyone: this file is sourced by every subcommand, so a `[ -d ] || exit 1`
+# on this line took `down`, `status`, `logs`, `ui`, `env` and `sql` down with
+# it -- none of which read the workspace, and one of which is how a running
+# stack is stopped. Pointing the join at a checkout that later gets renamed
+# would leave the stack unstoppable by its own tool. An issue tracker this
+# stack does not install cannot be a precondition of the stack's lifecycle,
+# and that has to include its path being reachable. [LAW:locality-or-seam]
+#
+# A path that does not resolve is left exactly as configured rather than
+# becoming the empty string a failed `cd` would assign, so the two places that
+# do care -- ct_write_lit_bridge and ct_lit_status -- can name what the user
+# actually asked for.
 : "${CT_LIT_WORKSPACE:=$CT_ROOT}"
-[ -d "$CT_LIT_WORKSPACE" ] || {
-  printf '\033[31mERROR: CT_LIT_WORKSPACE is not a directory that exists: %s\033[0m\n' \
-    "$CT_LIT_WORKSPACE" >&2
-  exit 1
-}
-CT_LIT_WORKSPACE="$(cd "$CT_LIT_WORKSPACE" && pwd)"
+CT_LIT_WORKSPACE="$([ -d "$CT_LIT_WORKSPACE" ] && cd "$CT_LIT_WORKSPACE" && pwd \
+                   || printf '%s' "$CT_LIT_WORKSPACE")"
 
 # How long lit may take to answer before `ct` stops waiting on it. Matches the
 # command_read_timeout config/clickhouse.yaml gives the very same call, so the
 # two sides agree on how patient this stack is with Dolt.
 CT_LIT_TIMEOUT_SECONDS=60
+
+# How long `ct` waits on a ClickHouse query over HTTP. Derived rather than
+# written down, because the longest thing ClickHouse can legitimately be doing
+# on our behalf is the lit export above: claude.ticket_events runs it through
+# executable(), so a bound below CT_LIT_TIMEOUT_SECONDS hangs up on a query the
+# server is still lawfully working on, and the failure then arrives as a curl
+# timeout under a die message that enumerates causes it is not.
+# [LAW:one-source-of-truth] two independently written numbers describing one
+# wait had already drifted to 30 and 60; a derived one cannot drift again.
+CT_CLICKHOUSE_WORK_SECONDS=30   # ClickHouse's own budget, on top of lit's
+CT_CLICKHOUSE_TIMEOUT_SECONDS=$(( CT_LIT_TIMEOUT_SECONDS + CT_CLICKHOUSE_WORK_SECONDS ))
 
 # lit's history as rows, and the turn grain attributed to a ticket. The two sit
 # on opposite sides of the distinction drawn above, and are worth keeping apart
@@ -167,6 +183,7 @@ export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
 export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_REQUESTS_VIEW
 export CT_CLICKHOUSE_PRICES_VIEW CT_CLICKHOUSE_SCRIPTS_DIR
 export CT_LIT_EXPORT_SCRIPT CT_LIT_WORKSPACE CT_LIT_TIMEOUT_SECONDS
+export CT_CLICKHOUSE_TIMEOUT_SECONDS
 export CT_CLICKHOUSE_TICKET_EVENTS_VIEW CT_CLICKHOUSE_TICKET_TURNS_VIEW
 
 # --- pinned tool releases ---------------------------------------------------
