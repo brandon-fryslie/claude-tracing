@@ -38,6 +38,24 @@ CT_CLICKHOUSE_DATA_DIR="$CT_VAR_DIR/clickhouse"
 CT_CLICKHOUSE_DATABASE=claude
 CT_CLICKHOUSE_TABLE=spans
 
+# Events (hook runs, skill activations, API errors, and more) land beside the
+# spans rather than in a rotating file. The measured arithmetic that decided
+# that is stated once, in the events table's comment in config/clickhouse.yaml,
+# and deliberately not repeated here -- the short version is that the file
+# ceiling held about two weeks and then dropped the oldest data with no error
+# and no log line. [LAW:no-silent-failure]
+#
+# Sharing the store means sharing the retention authority: that table states the
+# same one-year TTL as spans, so "how far back does my data go" has one answer
+# for both signals instead of a TTL for one and a rotation count for the other.
+# [LAW:one-source-of-truth]
+#
+# Held true exactly as CT_CLICKHOUSE_TABLE is: collector.yaml reads it as the
+# exporter's logs_table_name, and `ct verify` interpolates it into the query
+# that asserts the logs pipeline still lands, so a rename that misses one side
+# fails loudly on the next run.
+CT_CLICKHOUSE_EVENTS_TABLE=events
+
 # The request-grain view over that table: one row per llm_request, carrying what
 # it cost and what it had to do with a tool call. Named here rather than spelled
 # out at each of its three uses in `ct`, so renaming it is one edit and not four.
@@ -185,7 +203,8 @@ export CT_COLLECTOR_TELEMETRY_PORT CT_CLAUDE_METRICS_PORT
 export CT_JAEGER_OTLP_PORT CT_JAEGER_UI_PORT CT_JAEGER_HEALTH_PORT
 export CT_JAEGER_TELEMETRY_PORT CT_TRACE_TTL
 export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
-export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_REQUESTS_VIEW
+export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_EVENTS_TABLE
+export CT_CLICKHOUSE_REQUESTS_VIEW
 export CT_CLICKHOUSE_PRICES_VIEW CT_CLICKHOUSE_SCRIPTS_DIR
 export CT_LIT_EXPORT_SCRIPT CT_LIT_WORKSPACE CT_LIT_TIMEOUT_SECONDS
 export CT_CLICKHOUSE_TIMEOUT_SECONDS CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS

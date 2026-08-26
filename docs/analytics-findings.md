@@ -157,7 +157,10 @@ claude ──▶ collector ─┬─▶ jaeger + badger    7 days   viewing (wor
 ```
 
 The collector already fans signals out — traces to Jaeger, metrics to Prometheus, logs to
-a file — so this adds an exporter rather than rewiring anything.
+a file — so this adds an exporter rather than rewiring anything. (The logs leg has since
+moved: measuring it showed the file ceiling held about two weeks, so events went to
+ClickHouse too, on the same one-year TTL. The arithmetic is in the `claude.events` comment
+in `config/clickhouse.yaml`. See `claude-analytics-zbi.7`.)
 
 **Jaeger deliberately does not sit on ClickHouse.** Jaeger 2.20 ships a ClickHouse backend,
 but the binary prints `WARNING: ClickHouse Storage is Experimental`, and there's no reason
@@ -374,7 +377,7 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | 7 of 38 turns invoked no model | **Measured** — counted from `claude.session_turns` |
 | Turns per completed ticket: 1, 1, 1, 5 | **Measured** — n=4 tickets, all `claude-opus-5[1m]`, small sample |
 | Average turns to complete a ticket with Sonnet 5 | **Unanswerable** — no Sonnet 5 turns recorded |
-| Events pipeline volume vs its 256 MB ceiling | **Unmeasured** — nobody has counted; ticket 7 measures first |
+| Events pipeline volume vs its 256 MB ceiling | **Measured** — 4,798 records over 82.2h; the ceiling held ~2 weeks, which moved events into ClickHouse. Full derivation in the `claude.events` comment in `config/clickhouse.yaml` |
 | `agent_id` on llm_request, `subagent_type` on the Agent tool span | **Measured** — traced session spawning a subagent, 2026-08-23 |
 | `parent_agent_id` exists at all | **Unmeasured** — never seen in this stack's data; the column is empty |
 | ClickHouse self-extracts on first run | **Measured** — 161 MB downloaded, 855 MB after one `--version` |
