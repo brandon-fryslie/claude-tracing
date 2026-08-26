@@ -13,8 +13,13 @@
 # A probe prints one fact about here, or nothing when the fact does not apply.
 # Nothing is a real answer, not a failure: claude runs in plenty of directories
 # that are not git checkouts. Git reports that on stderr and exits non-zero, so
-# discarding both is reading the answer we asked for -- the same move ct_pid_of
-# makes with kill -0 -- rather than a failure being hidden.
+# discarding both is reading the answer we asked for rather than hiding a
+# failure: the exit status IS the fact being collected, and the message on
+# stderr only restates it. Stated as the pattern rather than by pointing at
+# another function that also follows it -- a comment in one file naming code in
+# another is a copy of a fact kept where it cannot see the fact change, and the
+# pointer that used to be here outlived the line it named.
+# [LAW:one-source-of-truth]
 
 ct_probe_repo_name() {
   local toplevel

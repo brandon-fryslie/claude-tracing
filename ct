@@ -264,8 +264,9 @@ ct_record_pid() {
   ct_signal_until_gone TERM "$pid" "$STOP_TIMEOUT_SECONDS" \
     || ct_signal_until_gone KILL "$pid" "$KILL_GRACE_SECONDS" \
     || ct_die "$name started as pid $pid, its pidfile could not be written to
-  $(ct_pidfile "$name"), and it survived both TERM and KILL. It is running now
-  and nothing records it: find it with 'ps -p $pid' and stop it by hand."
+  $(ct_pidfile "$name"), and neither TERM nor KILL got rid of it -- whether they
+  were ignored or refused is in kill's own output above. It is running now and
+  nothing records it: find it with 'ps -p $pid' and stop it by hand."
   ct_die "$name started as pid $pid but $(ct_pidfile "$name") could not be
   written -- killed it rather than leave a process nothing can see."
 }
@@ -291,11 +292,16 @@ ct_process_gone() { ! ct_process_exists "$1"; }
 # signal) is the one thing an operator staring at a service that will not stop
 # needs to see. [LAW:no-silent-failure]
 #
-# What makes that sentence true is one line down, in ct_process_exists: a
+# What makes that sentence true is ct_process_exists, in lib/common.sh: a
 # refused signal falls to a predicate that says the process is still there, so
 # the function returns failure and the caller speaks up. Against a kill-based
 # predicate the same EPERM read as "gone" and this reported success over a
 # living process -- the failure was not merely unsurfaced, it was inverted.
+#
+# What this does NOT report is which of the two happened, and callers must not
+# write messages that assume: a refused signal returns here immediately, an
+# ignored one only after the bound. The distinction is real but it is already
+# in the operator's hands, one line above ours, in kill's own errno text.
 ct_signal_until_gone() {
   local signal="$1" pid="$2" seconds="$3"
   kill -"$signal" "$pid" || ct_process_gone "$pid" || return 1
@@ -412,15 +418,26 @@ ct_stop_service() {
   if [ -n "$pid" ]; then
     # TERM and no further, unlike ct_record_pid: a service that will not stop
     # keeps its pidfile, so it stays visible to './ct status' and the operator
-    # decides what to do about it. Escalating buys no time here -- the TERM
-    # bound has already been waited out by the time it would run -- so the whole
-    # trade is a message the operator must read against ClickHouse killed in the
-    # middle of closing its parts. ct_record_pid escalates because there the
-    # message has nothing to point at: no record, no pid to find it by later.
+    # decides what to do about it. Escalating buys nothing either way it could
+    # get here -- the bound has already been spent, or the signal was refused
+    # and KILL would be refused by the same permissions -- so the whole trade is
+    # a message the operator must read against ClickHouse killed in the middle
+    # of closing its parts. ct_record_pid escalates because there the message
+    # has nothing to point at: no record, no pid to find it by later.
+    #
+    # "Up to", because this is reached two ways and only one of them waited.
+    # ct_signal_until_gone returns immediately when the signal is refused, so a
+    # message claiming the bound elapsed would be false in exactly the case an
+    # operator most needs to trust it. The number is still worth printing -- the
+    # common case is a hung service that really did outlast it -- but what ct
+    # was willing to wait is a fact about ct, and what actually elapsed is not
+    # something this line measured. [FRAMING:representation]
     ct_signal_until_gone TERM "$pid" "$STOP_TIMEOUT_SECONDS" \
-      || ct_die "$name (pid $pid) is still running ${STOP_TIMEOUT_SECONDS}s
-  after SIGTERM. Its pidfile is left in place, so it is still visible to
-  './ct status' and './ct up' will not start a second copy."
+      || ct_die "$name (pid $pid) is still running.
+  ct waited up to ${STOP_TIMEOUT_SECONDS}s after SIGTERM; if the signal itself
+  was refused, kill's own message is directly above this one. The pidfile is
+  left in place, so './ct status' still sees it and './ct up' will not start a
+  second copy."
     ct_ok "$name stopped"
   else
     ct_info "$name not running"
