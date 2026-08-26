@@ -30,6 +30,43 @@ CT_JAEGER_TELEMETRY_PORT=18888  # jaeger's own internal metrics
 CT_CLICKHOUSE_HTTP_PORT=8123    # clickhouse SQL over HTTP -- what `ct sql` talks to
 CT_CLICKHOUSE_NATIVE_PORT=9000  # clickhouse <- collector (native protocol)
 
+# --- what this stack is pointed at ------------------------------------------
+# The complete set of resource service.names whose telemetry belongs in the
+# sinks. Two subjects, and the list is closed: everything else arriving at the
+# collector is this stack talking about itself, and collector.yaml's filter
+# drops it.
+#
+# A third subject costs three edits, and they are worth knowing before you make
+# the first: a constant here, one clause in the anchored OTTL condition in
+# config/collector.yaml, and the `mine` list in ct's ct_foreign_row_query.
+#
+# One OTTL clause and not three, because that condition is written once and
+# aliased into the metrics and logs pipelines -- adding a subject to traces
+# alone is not a mistake this pair can make. But `mine` is a separate statement
+# of the same membership, in SQL rather than OTTL, and it has to be: the filter
+# needs the names as clauses, the count needs them as a list. What holds the
+# three together is that every way of getting them out of step fails loudly.
+# Narrow the filter and stage 2 dies with a sink that never received the
+# selftest run. Widen it past `mine` and stage 4 dies calling the new subject's
+# own healthy telemetry foreign. There is no combination that goes quiet, which
+# is the property to preserve if a fourth place ever needs the set.
+#
+# Naming them here rather than in `ct` is what makes that filter possible at
+# all -- config/*.yaml can only read this file, via ${env:...}, so an allowlist
+# that lived beside the emitters would be a second copy of both names that
+# nothing checks. [LAW:one-source-of-truth]
+
+# Claude Code's own resource service.name. cmd_env deliberately does not set
+# OTEL_SERVICE_NAME, so this is the name spans arrive under -- and cmd_env is why
+# that is true, which is what keeps this constant honest rather than a guess.
+CT_CLAUDE_SERVICE_NAME=claude-code
+
+# `ct verify` stage 2 stamps its synthetic traces, metrics and logs with this.
+# It is stack-authored telemetry that is nonetheless a subject and not chatter:
+# the whole point of the payload is to travel the pipelines and be found in
+# every sink, so the filter has to pass it or the check it powers cannot pass.
+CT_SELFTEST_SERVICE=claude-tracing-selftest
+
 # --- the two trace sinks ----------------------------------------------------
 # Two sinks, two jobs, no dependency between them. Badger answers "show me this
 # trace" for a week; ClickHouse answers "sum tokens by month" for a year. Either
@@ -209,6 +246,7 @@ export CT_CLICKHOUSE_PRICES_VIEW CT_CLICKHOUSE_SCRIPTS_DIR
 export CT_LIT_EXPORT_SCRIPT CT_LIT_WORKSPACE CT_LIT_TIMEOUT_SECONDS
 export CT_CLICKHOUSE_TIMEOUT_SECONDS CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS
 export CT_CLICKHOUSE_TICKET_EVENTS_VIEW CT_CLICKHOUSE_TICKET_TURNS_VIEW
+export CT_CLAUDE_SERVICE_NAME CT_SELFTEST_SERVICE
 
 # --- pinned tool releases ---------------------------------------------------
 CT_JAEGER_VERSION=2.20.0
