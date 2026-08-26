@@ -104,7 +104,32 @@ CT_LIT_EXPORT_SCRIPT=lit_export.sh
 # server: the stack can trace any repo, but the ticket views answer for exactly
 # one backlog, and this names which. Override it to point the join at another
 # checkout, then re-run `./ct up` to rewrite the script.
-CT_LIT_WORKSPACE="${CT_LIT_WORKSPACE:-$CT_ROOT}"
+#
+# Resolved to an absolute path here, because a relative one means different
+# directories to different readers. It is `cd`'d into by at least two processes
+# with unrelated working directories -- `ct` itself, from wherever the user
+# invoked it, and the ClickHouse server running the generated bridge script at
+# query time -- so `CT_LIT_WORKSPACE=../other-project`, which is the natural
+# reading of the sentence above, would silently name two different trees. One
+# string, one directory, decided once. [LAW:one-source-of-truth]
+#
+# A path that does not exist fails here and by name rather than surfacing later
+# as an empty backlog. [LAW:no-silent-failure]
+# Checked before it is resolved, and not after, so the message can still name
+# what the user actually asked for: the resolving assignment overwrites the
+# variable with the empty output of a failed `cd` before any `||` could read it.
+: "${CT_LIT_WORKSPACE:=$CT_ROOT}"
+[ -d "$CT_LIT_WORKSPACE" ] || {
+  printf '\033[31mERROR: CT_LIT_WORKSPACE is not a directory that exists: %s\033[0m\n' \
+    "$CT_LIT_WORKSPACE" >&2
+  exit 1
+}
+CT_LIT_WORKSPACE="$(cd "$CT_LIT_WORKSPACE" && pwd)"
+
+# How long lit may take to answer before `ct` stops waiting on it. Matches the
+# command_read_timeout config/clickhouse.yaml gives the very same call, so the
+# two sides agree on how patient this stack is with Dolt.
+CT_LIT_TIMEOUT_SECONDS=60
 
 # lit's history as rows, and the turn grain attributed to a ticket. The two sit
 # on opposite sides of the distinction drawn above, and are worth keeping apart
@@ -141,7 +166,7 @@ export CT_JAEGER_TELEMETRY_PORT CT_TRACE_TTL
 export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
 export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_REQUESTS_VIEW
 export CT_CLICKHOUSE_PRICES_VIEW CT_CLICKHOUSE_SCRIPTS_DIR
-export CT_LIT_EXPORT_SCRIPT CT_LIT_WORKSPACE
+export CT_LIT_EXPORT_SCRIPT CT_LIT_WORKSPACE CT_LIT_TIMEOUT_SECONDS
 export CT_CLICKHOUSE_TICKET_EVENTS_VIEW CT_CLICKHOUSE_TICKET_TURNS_VIEW
 
 # --- pinned tool releases ---------------------------------------------------

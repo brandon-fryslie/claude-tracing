@@ -44,8 +44,8 @@ The ticket half closed differently than expected, and worth recording as a corre
 the paragraph above: it needed nothing recorded at all. `lit` already stores the session id
 of whoever moved a ticket, so the join key existed before the question was asked — see
 "Turns per ticket" below. The perishability argument still holds for everything else, but it
-did not hold here, and the ticket that was ranked last on the theory that it *could* be
-built retroactively turned out to be exactly right about that.
+did not hold here: the ticket was ranked last *of the recording work* on the theory that it
+could be built retroactively, and that theory turned out to be exactly right.
 
 What remains is the review question: nothing derives automatically what marks a session as
 a review, and that rides in on the launcher's passthrough.

@@ -37,6 +37,12 @@ launched with, a ClickHouse row whose promoted columns are populated rather than
 present, the tokens that session spent being attributable to the tool call it made, and
 every one of its requests carrying a price so the session has a cost in dollars.
 
+One last check runs only if it applies: where a [`lit`](#how-many-turns-a-ticket-took-and-what-it-cost)
+workspace answers, verify confirms its history still parses and its actors are still
+session ids spans can be joined on. With no `lit`, no tickets in it, or no ticket a Claude
+session has moved, it says so and carries on — the telemetry path does not depend on an
+issue tracker this stack doesn't install.
+
 Each stage picks a session id before it emits anything and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still
 lying around. Nothing the stack writes sits outside that check: break any one exporter
@@ -441,9 +447,12 @@ so the question is about the weight of the work.
 If `lit` can't be read, these views raise an error rather than returning no rows. That
 distinction is the whole point — "you have no tickets" and "I couldn't reach the tracker"
 must not arrive as the same answer, or an average over nothing looks like a real number.
-`ct verify` re-checks both halves on every run: that `lit`'s export still parses into the
-fields these views read, and that its actors are still session ids spans can be joined on.
-Both fail silently otherwise — a renamed key reads as an empty string, not an error.
+When the ticket join is checked at all, `ct verify` re-checks both halves: that `lit`'s
+export still parses into the fields these views read, and that its actors are still session
+ids spans can be joined on. Both fail silently otherwise — a renamed key reads as an empty
+string, not an error. Neither check runs when there is no `lit` workspace, no ticket history
+in it yet, or no ticket a Claude session has moved; verify says which of those it found
+rather than implying it checked.
 
 ## What gets recorded
 

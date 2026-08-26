@@ -573,9 +573,10 @@ startup_scripts:
     # `executable` runs the script per query rather than importing lit's history
     # into a table here. An imported copy would need a refresh command, and the
     # failure mode of a refresh command is a store that answers a stale question
-    # with a straight face. It costs the few seconds lit takes to open its store,
-    # paid by ticket queries only -- a correctness argument that does not need a
-    # performance one, the same trade claude.subagent_requests makes above.
+    # with a straight face. Measured, it costs about 0.14s once lit's Dolt store
+    # is warm and several seconds on the first call of the day, paid by ticket
+    # queries only -- a correctness argument that does not need a performance
+    # one, the same trade claude.subagent_requests makes above.
     #
     # THE BORDER IS LOUD, AND HAD TO BE MADE SO. `executable` reports a command
     # that exits non-zero, or does not exist at all, as zero rows -- so a missing
@@ -741,7 +742,14 @@ startup_scripts:
           -- Never multiply TotalTokens by a rate: the four counts bill at rates
           -- spanning 50x. This is the sum of what each request already cost.
           worked.CostUSD       AS CostUSD,
-          worked.Unpriced = 0  AS Priced,
+          -- Requests > 0 is not redundant with Unpriced = 0, it is what stops
+          -- this column lying. An unmatched LEFT JOIN fills Unpriced with 0
+          -- rather than NULL, so "every request found a rate" would read true
+          -- for a turn with no requests at all -- zero dollars shaped like free,
+          -- the exact trap claude.llm_requests.Priced exists to prevent, one
+          -- grain up. Priced now means what its sibling means, and InvokedModel
+          -- below is where "there was nothing to price" is said.
+          worked.Requests > 0 AND worked.Unpriced = 0 AS Priced,
           worked.Requests > 0  AS InvokedModel
         FROM turn
         LEFT JOIN (
@@ -783,9 +791,9 @@ startup_scripts:
     # confidently wrong under any of the obvious alternatives:
     #
     #   A ticket's work window runs from the first transition into in_progress to
-    #   the last into closed. A ticket is rarely one session -- zbi.5 was started
-    #   by one and closed by another two days later -- so the window, not the
-    #   session, is the unit.
+    #   the last into closed, or to now() while it is still open. A ticket is
+    #   rarely one session -- zbi.5 was started by one and closed by another two
+    #   days later -- so the window, not the session, is the unit.
     #
     #   Its sessions are the ones lit records MOVING it -- claiming, closing,
     #   reopening -- rather than every session that touched it. That is a floor
@@ -802,12 +810,20 @@ startup_scripts:
     #   Turns that invoked no model are excluded, by the discriminator
     #   session_turns names rather than by a join quietly dropping them.
     #
-    # The window is also what keeps a session that worked several tickets in a
-    # row from being counted whole against each: its turns fall into whichever
-    # window was open at the time. Overlapping windows -- a ticket abandoned and
-    # resumed while another was open -- do count a turn against both, and there
-    # is no way to split it, because nothing records which of the two the turn
-    # was actually for.
+    # ONE READ OF LIT, and it has to be exactly one. claude.ticket_events is a
+    # plain view over an external process, so ClickHouse re-runs `lit export` for
+    # every textual reference to it -- measured, and a CTE does not help, because
+    # CTEs here are inlined rather than materialised. Two reads of a live store
+    # can disagree, and a transition landing between them would leave the two
+    # halves of this join holding different backlogs, silently dropping the turns
+    # of whichever ticket they disagreed about.
+    #
+    # A scalar subquery is the one thing ClickHouse does evaluate once, so the
+    # whole event log is frozen into `Moves` up front and everything below reads
+    # that constant. Measured at one invocation per query, against three for the
+    # obvious CTE version. It also keeps the plan flat: an earlier attempt to get
+    # to one read with nested window functions was rejected by ClickHouse itself
+    # with TOO_MANY_QUERY_PLAN_OPTIMIZATIONS. [LAW:one-source-of-truth]
     #
     # WorkedUntil is a value, not a branch: a ticket that is still open has been
     # worked up to now, so the window's upper bound is now() rather than a
@@ -815,8 +831,18 @@ startup_scripts:
     # so that "turns to COMPLETE a ticket" can exclude the open ones -- averaging
     # over a ticket still being worked measures how far it has got, not what it
     # took. [LAW:dataflow-not-control-flow]
+    #
+    # WHAT IS STILL NOT SEPARABLE, stated rather than left to be discovered: two
+    # tickets genuinely worked in the same turn share it, because nothing records
+    # which of them the turn was for. And a session that claims a ticket, never
+    # closes it, and never touches another ticket keeps accruing to it -- neither
+    # store holds anything that could bound that case.
     - query: |
         CREATE OR REPLACE VIEW claude.ticket_turns AS
+        WITH
+          (SELECT groupArray((Ticket, SessionId, At, ToStatus))
+           FROM claude.ticket_events
+           WHERE ToStatus != '') AS Moves
         SELECT
           life.Ticket       AS Ticket,
           life.Started      AS Started,
@@ -834,11 +860,11 @@ startup_scripts:
           turn.Priced       AS Priced
         FROM (
           SELECT
-            Ticket,
+            move.1 AS Ticket,
             -- The first claim ever, so a ticket abandoned and resumed reports
             -- the total effort it took rather than only the last attempt.
-            minIf(At, ToStatus = 'in_progress') AS Started,
-            maxIf(At, ToStatus = 'closed')      AS Closed,
+            minIf(move.3, move.4 = 'in_progress') AS Started,
+            maxIf(move.3, move.4 = 'closed')      AS Closed,
             -- Completed asks what the ticket's status IS, not whether it was
             -- ever closed. The difference is a reopened ticket: "has a close
             -- ever happened" stays true forever, so it would be reported as
@@ -847,14 +873,14 @@ startup_scripts:
             -- after the reopen. Reading the last transition instead makes a
             -- reopened ticket open again, which puts its window back on now()
             -- and picks those turns up. [LAW:no-silent-failure]
-            argMaxIf(ToStatus, At, ToStatus != '') = 'closed' AS Completed,
+            argMax(move.4, move.3) = 'closed'      AS Completed,
             if(Completed, Closed, now64(9, 'UTC')) AS WorkedUntil
-          FROM claude.ticket_events
+          FROM (SELECT arrayJoin(Moves) AS move)
           GROUP BY Ticket
           -- A ticket nobody ever claimed has no window and so no turns. Absent
           -- rather than zero: zero turns is an answer, and this is the absence
           -- of one. [LAW:parse-dont-validate]
-          HAVING countIf(ToStatus = 'in_progress') > 0
+          HAVING countIf(move.4 = 'in_progress') > 0
         ) AS life
         INNER JOIN (
           -- A session counts as working a ticket when it MOVED the ticket --
@@ -864,14 +890,44 @@ startup_scripts:
           -- one sitting, and on the looser reading it becomes a participant in
           -- every one of them, donating its turns to whichever windows happened
           -- to be open at the time. ToStatus is empty for exactly those
-          -- annotating events, so filtering on it is what keeps a backlog tidy-up
-          -- from being counted as work on everything it tidied.
-          SELECT DISTINCT Ticket, SessionId
-          FROM claude.ticket_events
-          WHERE SessionId != '' AND ToStatus != ''
+          -- annotating events, and Moves is filtered on it above.
+          --
+          -- SwitchedAway is the moment this session moved on: its next
+          -- transition of any kind after it engaged with this ticket. Without
+          -- it, one ticket left in_progress and forgotten has a window running
+          -- to now() forever and quietly collects that session's entire
+          -- subsequent history -- months of unrelated turns and cost filed under
+          -- a ticket nobody ever finished. That needs only ONE stale ticket,
+          -- where the shared-turn caveat above needs two live ones.
+          --
+          -- It cannot be a LOWER bound keyed on the session's first event here,
+          -- which is the obvious reading: zbi.5's closing session has exactly
+          -- one event on that ticket, the `done` at the very end, and all its
+          -- real work precedes it. The ticket's own window stays the primary
+          -- bound; this is a cap laid on top of it.
+          --
+          -- The sentinel is an identity, not a special case: a session that
+          -- never moved again contributes +infinity, so `least` below decides
+          -- the bound with no branch to read.
+          -- [LAW:dataflow-not-control-flow]
+          SELECT
+            Ticket,
+            SessionId,
+            arrayReduce('min', arrayConcat(
+              [toDateTime64('2262-01-01 00:00:00', 9, 'UTC')],
+              arrayMap(later -> later.3,
+                       arrayFilter(later -> later.2 = SessionId
+                                            AND later.3 > EngagedFrom,
+                                   Moves)))) AS SwitchedAway
+          FROM (
+            SELECT move.1 AS Ticket, move.2 AS SessionId, min(move.3) AS EngagedFrom
+            FROM (SELECT arrayJoin(Moves) AS move)
+            WHERE move.2 != ''
+            GROUP BY Ticket, SessionId
+          )
         ) AS participant ON participant.Ticket = life.Ticket
         INNER JOIN claude.session_turns AS turn
           ON turn.SessionId = participant.SessionId
         WHERE turn.InvokedModel
-          AND turn.Began <= life.WorkedUntil
+          AND turn.Began <= least(life.WorkedUntil, participant.SwitchedAway)
           AND turn.Ended >= life.Started
