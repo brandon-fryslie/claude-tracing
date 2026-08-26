@@ -614,7 +614,13 @@ startup_scripts:
           -- RFC3339 with a Z, so the zone is in the value rather than inherited
           -- from the host. Pinned to UTC here so the comparison against span
           -- timestamps is between two instants and not two local readings.
-          parseDateTime64BestEffortOrNull(
+          --
+          -- The throwing parse, not the OrNull one. lit's timestamps are machine
+          -- written, so one that will not parse is a defect rather than a value
+          -- that is legitimately absent -- and OrNull would turn it into a NULL
+          -- that every aggregate below silently skips, moving a ticket's window
+          -- with nothing to show for it. [LAW:no-silent-failure]
+          parseDateTime64BestEffort(
             JSONExtractString(event, 'created_at'), 9, 'UTC') AS At,
           JSONExtractString(event, 'action')   AS Action,
           -- The status transition, taken from the event's `changes` rather than
@@ -664,6 +670,11 @@ startup_scripts:
     # trace here holds three distinct sessions, and `ct verify` creates that
     # shape on every run. SessionId is the key; TraceId is not.
     #
+    # The turn definition is a CTE because it is needed twice -- once as the list
+    # of turns, once to place each request in one -- and a definition spelled out
+    # twice is two definitions that will eventually disagree about where a turn
+    # ends. [LAW:one-source-of-truth]
+    #
     # The LEFT JOIN is load-bearing. Every session on file ends with one or more
     # sub-second turns that invoked no model at all -- a slash command handled
     # locally, an interrupted line -- and an inner join would drop them, making
@@ -679,6 +690,15 @@ startup_scripts:
     # is what separates the main loop from the subagents running under it.
     - query: |
         CREATE OR REPLACE VIEW claude.session_turns AS
+        WITH turn AS (
+          SELECT
+            SessionId,
+            InteractionSequence AS Turn,
+            toDateTime64(Timestamp, 9, 'UTC') AS Began,
+            Began + toIntervalNanosecond(Duration) AS Ended
+          FROM claude.spans
+          WHERE SpanType = 'interaction'
+        )
         SELECT
           turn.SessionId       AS SessionId,
           turn.Turn            AS Turn,
@@ -693,15 +713,7 @@ startup_scripts:
           worked.CostUSD       AS CostUSD,
           worked.Unpriced = 0  AS Priced,
           worked.Requests > 0  AS InvokedModel
-        FROM (
-          SELECT
-            SessionId,
-            InteractionSequence AS Turn,
-            toDateTime64(Timestamp, 9, 'UTC') AS Began,
-            Began + toIntervalNanosecond(Duration) AS Ended
-          FROM claude.spans
-          WHERE SpanType = 'interaction'
-        ) AS turn
+        FROM turn
         LEFT JOIN (
           SELECT
             SessionId,
@@ -724,15 +736,7 @@ startup_scripts:
               sum(request.TotalTokens)    AS TotalTokens,
               sum(request.CostUSD)        AS CostUSD,
               countIf(NOT request.Priced) AS Unpriced
-            FROM (
-              SELECT
-                SessionId,
-                InteractionSequence AS Turn,
-                toDateTime64(Timestamp, 9, 'UTC') AS Began,
-                Began + toIntervalNanosecond(Duration) AS Ended
-              FROM claude.spans
-              WHERE SpanType = 'interaction'
-            ) AS turn
+            FROM turn
             INNER JOIN claude.llm_requests AS request
               ON request.SessionId = turn.SessionId
             WHERE toDateTime64(request.Timestamp, 9, 'UTC')
@@ -753,9 +757,11 @@ startup_scripts:
     #   by one and closed by another two days later -- so the window, not the
     #   session, is the unit.
     #
-    #   Its sessions are the ones lit records acting on it. That is a floor and
-    #   not a census: a session that worked a ticket and neither claimed, closed
-    #   nor commented on it leaves no trace in lit and cannot be counted.
+    #   Its sessions are the ones lit records MOVING it -- claiming, closing,
+    #   reopening -- rather than every session that touched it. That is a floor
+    #   and not a census: a session that worked a ticket and never transitioned
+    #   it leaves no trace here and cannot be counted. The looser reading costs
+    #   more than it buys, and the reason is in the participant join below.
     #
     #   A turn counts when its interval OVERLAPS the window -- not when its
     #   timestamp falls inside it. Turns here are long: one turn ran 3.6 hours
@@ -811,9 +817,18 @@ startup_scripts:
           HAVING countIf(ToStatus = 'in_progress') > 0
         ) AS life
         INNER JOIN (
+          -- A session counts as working a ticket when it MOVED the ticket --
+          -- claimed it, closed it, reopened it -- and not merely when it touched
+          -- it. The distinction is load-bearing rather than fastidious: a
+          -- grooming pass edits the description and rank of dozens of tickets in
+          -- one sitting, and on the looser reading it becomes a participant in
+          -- every one of them, donating its turns to whichever windows happened
+          -- to be open at the time. ToStatus is empty for exactly those
+          -- annotating events, so filtering on it is what keeps a backlog tidy-up
+          -- from being counted as work on everything it tidied.
           SELECT DISTINCT Ticket, SessionId
           FROM claude.ticket_events
-          WHERE SessionId != ''
+          WHERE SessionId != '' AND ToStatus != ''
         ) AS participant ON participant.Ticket = life.Ticket
         INNER JOIN claude.session_turns AS turn
           ON turn.SessionId = participant.SessionId

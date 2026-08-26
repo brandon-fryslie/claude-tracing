@@ -394,9 +394,11 @@ The full definition, since the number is meaningless without it:
 - A ticket's window runs from its first move into `in_progress` to its last into `closed`.
   A ticket is often not one session — `zbi.5` was started by one and closed by another two
   days later — so the window, not the session, is the unit.
-- Its sessions are the ones `lit` records acting on it. That is a floor, not a census: a
-  session that worked a ticket and never claimed, closed or commented on it leaves no trace
-  in `lit` and cannot be counted.
+- Its sessions are the ones `lit` records *moving* it — claiming, closing, reopening — not
+  every session that touched it. A grooming pass that re-ranks thirty tickets in one sitting
+  would otherwise become a participant in all thirty and donate its turns to whichever
+  windows were open. That is a floor, not a census: a session that worked a ticket and never
+  transitioned it leaves no trace and cannot be counted.
 - Turns that invoked no model don't count. Every session on file ends with one or more
   sub-second turns — a slash command handled locally, an interrupted line — and counting
   them would inflate every ticket by one or two. They stay visible in

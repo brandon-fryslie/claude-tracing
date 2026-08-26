@@ -729,15 +729,22 @@ verify_claude() {
   # by going quiet rather than by erroring.
   #
   # JSONExtractString answers '' for a key that is not there. So if lit renames
-  # issue_id or created_at, nothing throws -- claude.ticket_events keeps
-  # returning exactly as many rows as before, every one of them blank, and every
-  # ticket question answers zero. Asserting on the extracted VALUES rather than
-  # on the row count is what makes this a check on the parse instead of on lit
-  # having answered at all. The border in config/clickhouse.yaml already covers
-  # the louder case where lit cannot be run.
+  # issue_id, nothing throws -- claude.ticket_events keeps returning exactly as
+  # many rows as before, every one of them blank, and every ticket question
+  # answers zero. Asserting on the extracted VALUES rather than on the row count
+  # is what makes this a check on the parse instead of on lit having answered at
+  # all. The border in config/clickhouse.yaml already covers the louder case
+  # where lit cannot be run, and the timestamp parse throws on its own.
+  #
+  # ToStatus and not Action, though Action is the more obvious field to reach
+  # for. Action is carried for readers and nothing joins on it, so asserting it
+  # would fail the day lit stopped emitting a label nothing here needs. ToStatus
+  # is the opposite: the window is built from it, and it comes out of the nested
+  # `changes` array, which is the most involved extraction in the view and so the
+  # one most likely to go quietly wrong. Assert what the join actually rests on.
   clickhouse_returns_a_row \
     "SELECT Ticket FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_EVENTS_VIEW
-      WHERE Ticket != '' AND At IS NOT NULL AND Action != '' LIMIT 1" \
+      WHERE Ticket != '' AND ToStatus != '' LIMIT 1" \
     || ct_die "lit answered, but nothing this stack reads came back from it.
   The export parsed and its version matched -- what came out empty is the fields
   claude.ticket_events pulls from each event. A renamed key reads as a blank
