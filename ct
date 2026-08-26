@@ -30,12 +30,6 @@ SINK_TIMEOUT_SECONDS=30
 # Long enough for an ordinary cleanup handler, short enough that a bound of N
 # seconds still means roughly N seconds.
 KILL_GRACE_SECONDS=5
-SELFTEST_SERVICE=claude-tracing-selftest
-
-# Claude Code's own resource service.name. cmd_env deliberately does not set
-# OTEL_SERVICE_NAME, so this is the name spans arrive under -- and cmd_env is why
-# that is true, which is what keeps this constant honest rather than a guess.
-CLAUDE_SERVICE_NAME=claude-code
 
 # --- service lifecycle ------------------------------------------------------
 # Every function below operates on a row of ct_services(). There is no
@@ -98,16 +92,21 @@ ct_start_service() {
   fi
   [ -x "$bin" ] || ct_die "$name binary missing at $bin -- run './ct up'"
 
-  # [LAW:single-enforcer] One rule for both daemons: a service in this stack never
-  # exports its own telemetry into the stack. Jaeger self-traces to localhost:4317
-  # by default, and a shell that has sourced `./ct env` would hand both services
-  # the exporter contract meant for Claude. Either way you get the stack's own
-  # chatter stored beside your Claude traces. Neutralised once, here.
-  # BSD env insists every -u precede the first NAME=VALUE; GNU env accepts both.
+  # A shell that has sourced `./ct env` is holding the exporter contract meant
+  # for Claude, and every daemon started from it would inherit that contract.
+  # Unset at the launch, so what a service does is a property of its config file
+  # and not of whose terminal it was started from.
+  #
+  # This is not what keeps the stack's own telemetry out of the store -- that
+  # rule is enforced once, in collector.yaml's filter/only_our_subjects, because
+  # the collector is the only place every signal crosses on the way to every
+  # sink. An OTEL_TRACES_EXPORTER=none stood here claiming the job until it was
+  # measured on 2026-08-26: jaeger emitted 30 spans per 30 query-API requests
+  # with it set and 31 without, so it had never suppressed one.
+  # [LAW:single-enforcer]
   nohup env \
     -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
     -u OTEL_EXPORTER_OTLP_HEADERS -u CLAUDE_CODE_ENABLE_TELEMETRY \
-    OTEL_TRACES_EXPORTER=none \
     "$@" >>"$(ct_logfile "$name")" 2>&1 &
   printf '%s\n' "$!" > "$(ct_pidfile "$name")"
   ct_await_ready "$name" "$ready"
@@ -538,7 +537,7 @@ EOF
 # session that looks labelled and carries nothing.
 verify_labels() {
   local value expected actual root sandbox tail purpose contributed
-  ct_info "stage 1/3: label encoding (pure, no network)"
+  ct_info "stage 1/4: label encoding (pure, no network)"
 
   while IFS='|' read -r value expected; do
     actual="$(ct_percent_encode "$value")"
@@ -811,7 +810,7 @@ selftest_span() {
   local needle="$1" now_ns="$2" trace_id
   trace_id="${needle//-/}"
   cat <<EOF
-{"resourceSpans":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+{"resourceSpans":[{"resource":{"attributes":[$(otlp_attr service.name "$CT_SELFTEST_SERVICE")]},
 "scopeSpans":[{"spans":[{"traceId":"$trace_id","spanId":"${trace_id:0:16}",
 "name":"ct.selftest","kind":1,
 "startTimeUnixNano":"$now_ns","endTimeUnixNano":"$((now_ns + 1000000))",
@@ -822,7 +821,7 @@ EOF
 selftest_metric() {
   local needle="$1" now_ns="$2"
   cat <<EOF
-{"resourceMetrics":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+{"resourceMetrics":[{"resource":{"attributes":[$(otlp_attr service.name "$CT_SELFTEST_SERVICE")]},
 "scopeMetrics":[{"metrics":[{"name":"ct_selftest_runs","sum":{
 "aggregationTemporality":2,"isMonotonic":true,
 "dataPoints":[{"asInt":"1","startTimeUnixNano":"$now_ns","timeUnixNano":"$now_ns",
@@ -833,7 +832,7 @@ EOF
 selftest_log() {
   local needle="$1" now_ns="$2"
   cat <<EOF
-{"resourceLogs":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+{"resourceLogs":[{"resource":{"attributes":[$(otlp_attr service.name "$CT_SELFTEST_SERVICE")]},
 "scopeLogs":[{"logRecords":[{"timeUnixNano":"$now_ns",
 "body":{"stringValue":"ct.selftest"},
 "attributes":[$(otlp_attr session.id "$needle")]}]}]}]}
@@ -854,7 +853,7 @@ verify_transport() {
   needle="$(ct_uuid)"
   now_ns=$(( $(date +%s) * 1000000000 ))
 
-  ct_info "stage 2/3: synthetic traces, metrics and logs -> collector -> every sink"
+  ct_info "stage 2/4: synthetic traces, metrics and logs -> collector -> every sink"
 
   while IFS='|' read -r signal payload; do
     curl -fsS --max-time 5 -o /dev/null \
@@ -867,7 +866,7 @@ verify_transport() {
   # The fan-out means one sink can fail while the others pass, which is the whole
   # point of having four -- and the reason each is a separate assertion rather
   # than a second guess at the first one.
-  ct_await_run_in_every_sink "$SELFTEST_SERVICE" "$needle"
+  ct_await_run_in_every_sink "$CT_SELFTEST_SERVICE" "$needle"
   ct_ok "  transport works: session.id '$needle' is queryable in all four"
 }
 
@@ -879,7 +878,7 @@ verify_transport() {
 # restatement: add, remove or rename a label and the expectation moves with it,
 # because there is no second list here to forget.
 claude_labels_searchable() {
-  ct_output_holds "$1" jaeger_traces_tagged "$CLAUDE_SERVICE_NAME" \
+  ct_output_holds "$1" jaeger_traces_tagged "$CT_CLAUDE_SERVICE_NAME" \
     "$(ct_join_labels jaeger_tag_of),$(jaeger_tag_of session.id "$1")"
 }
 
@@ -988,15 +987,20 @@ verify_ticket_join() {
     ./ct sql \"SELECT DISTINCT Actor FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_EVENTS_VIEW FORMAT TSV\""
 
   ct_ok "  lit's history is readable, and its actors are session ids spans can be joined on"
+
+  # Offered by the check that just proved it answers, and by nothing else. The
+  # early returns above are the reason: a workspace with no ticket history, or
+  # none a Claude session moved, would print a query that correctly returns
+  # nothing and reads as a broken join. [LAW:no-silent-failure]
+  ct_trace "./ct sql \"SELECT Ticket, count() AS Turns, round(sum(CostUSD), 2) AS USD FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_TURNS_VIEW WHERE Completed GROUP BY Ticket FORMAT PrettyCompact\""
 }
 
 verify_claude() {
-  local ticket_hint=""
   local needle labels lit_status
   needle="$(ct_uuid)"
   labels="$(ct_work_labels)"
 
-  ct_info "stage 3/3: real claude session -> collector -> every sink"
+  ct_info "stage 3/4: real claude session -> collector -> every sink"
 
   # Run through the launcher rather than around it, so this stage covers the
   # path a real session takes -- labels included -- instead of a shortcut that
@@ -1010,7 +1014,7 @@ verify_claude() {
       -p "Run the bash command \`echo $needle\` and reply with nothing else." \
       >/dev/null ) || ct_die "the claude probe run failed"
 
-  ct_await_run_in_every_sink "$CLAUDE_SERVICE_NAME" "$needle"
+  ct_await_run_in_every_sink "$CT_CLAUDE_SERVICE_NAME" "$needle"
   ct_ok "  a real claude session reaches all four sinks"
 
   # No polling here, and that is a claim rather than an omission: the sink check
@@ -1121,7 +1125,6 @@ verify_claude() {
   case "${lit_status%%$'\t'*}" in
     ready)
       verify_ticket_join
-      ticket_hint="./ct sql \"SELECT Ticket, count() AS Turns, round(sum(CostUSD), 2) AS USD FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_TURNS_VIEW WHERE Completed GROUP BY Ticket FORMAT PrettyCompact\""
       ;;
     absent)
       ct_info "  no lit workspace answers at $CT_LIT_WORKSPACE -- ticket join not checked"
@@ -1134,18 +1137,92 @@ verify_claude() {
   ${lit_status#*$'\t'}"
       ;;
   esac
-  echo
-  ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
-  ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
-  ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
-  ct_trace "./ct sql \"SELECT round(sumIf(CostUSD, ServesToolCall), 2) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
-  [ -z "$ticket_hint" ] || ct_trace "$ticket_hint"
+}
+
+# Rows in the span store whose ServiceName is not one of this stack's subjects
+# -- which is to say, rows that should not exist at all.
+#
+# The two names come from lib/common.sh, the same pair collector.yaml's
+# filter/only_our_subjects allows, so neither side can be renamed alone. The set
+# MEMBERSHIP is stated in both places, and that is what makes a divergence loud
+# rather than silent: narrow the filter and stage 2 dies with a sink that never
+# received the selftest run; widen it past this list and stage 4 below dies with
+# the new name in its hand. [LAW:one-source-of-truth]
+#
+# The SQL is its own function so that the call which DECIDES and the call which
+# EXPLAINS a failure send the same bytes -- ct_clickhouse_error re-asks without
+# -f to buy back the server's own message, and re-asking a different question
+# would answer about a query that never failed. [LAW:one-source-of-truth]
+ct_foreign_span_query() {
+  printf '%s' "SELECT count()
+                 FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
+                WHERE ServiceName NOT IN ('$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE')
+                FORMAT TSV"
+}
+
+ct_foreign_span_count() {
+  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_span_query)"
+}
+
+# [LAW:verifiable-goals] Asserts the rule where it can actually be observed. That
+# the filter is CONFIGURED is not the property -- a processor can be dropped from
+# a pipeline, an OTTL condition can be edited into something that matches
+# nothing, and the config still loads. The property is that a whole verify run
+# leaves the store with no more foreign rows than it found.
+#
+# A delta and not an absolute count of zero: a store that accumulated jaeger
+# spans before this filter existed is history, not a fault, and asserting zero
+# would fail every install that ever ran the old code while offering it no way
+# forward. What this code is answerable for is what it ADDS.
+#
+# Nothing here sleeps waiting for a leak to settle, and nothing needs to: the
+# Jaeger query API polls that provoke the self-traces happen in stage 2, and an
+# entire real Claude session runs between them and this count. A filter that
+# regressed would have had all of stage 3 to deliver the evidence.
+# [LAW:no-ambient-temporal-coupling]
+verify_no_stack_telemetry() {
+  local before="$1" after
+  ct_info "stage 4/4: the stack recorded nothing of itself"
+
+  after="$(ct_foreign_span_count)" \
+    || ct_die "could not count foreign spans in $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE.
+  The same count answered before stage 1, so this is ClickHouse going away
+  mid-run rather than a query that was never going to work.
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_span_query)")"
+
+  [ "$after" -le "$before" ] || ct_die "this run stored $((after - before)) spans that no subject of this stack emitted.
+  Something now reaches a sink without crossing filter/only_our_subjects in
+  config/collector.yaml, or that filter no longer says what it used to. Jaeger
+  self-traces its own query API and is the usual author; the collector and
+  ClickHouse can acquire self-telemetry in any release.
+  Who it was:
+    ./ct sql \"SELECT ServiceName, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE ServiceName NOT IN ('$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE') GROUP BY 1 FORMAT PrettyCompact\"
+  Whether the filter still sees them at all -- incoming should exceed outgoing:
+    curl -s http://127.0.0.1:$CT_COLLECTOR_TELEMETRY_PORT/metrics | grep only_our_subjects"
+
+  ct_ok "  no span from this stack's own daemons reached the store"
 }
 
 cmd_verify() {
+  local foreign_before
+
+  # Taken before stage 1, because stage 2 polls Jaeger's query API and that poll
+  # is itself what provokes the leak this run must not commit.
+  foreign_before="$(ct_foreign_span_count)" \
+    || ct_die "$CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE would not answer a count -- is the stack up?
+    ./ct status
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_span_query)")"
+
   verify_labels
   verify_transport
   verify_claude
+  verify_no_stack_telemetry "$foreign_before"
+
+  echo
+  ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CT_CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
+  ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
+  ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
+  ct_trace "./ct sql \"SELECT round(sumIf(CostUSD, ServesToolCall), 2) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
 }
 
 # --- dispatch ---------------------------------------------------------------

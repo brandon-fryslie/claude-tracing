@@ -58,11 +58,16 @@ service:
       attributes:
         - name: service.name
           value: jaeger
-    # Jaeger self-traces its own query API to localhost:4317 -- our collector,
-    # which stores it straight back into Jaeger beside your Claude traces. Neither
-    # `traces.level: none` nor `traces.processors: []` here stops it; the switch
-    # that works is OTEL_TRACES_EXPORTER=none in the process environment, which ct
-    # sets for both daemons. Noted here because this is where you would look.
+    # Jaeger self-traces its own query API to localhost:4317 -- our collector --
+    # and nothing in this file stops it. `traces.level: none`,
+    # `traces.processors: []` and OTEL_TRACES_EXPORTER=none in the process
+    # environment were each tried and each measured not to work: the spans kept
+    # arriving, ~100 per `ct verify` run under ServiceName='jaeger'.
+    #
+    # So this is not where the rule lives. The collector drops them on the way in
+    # (filter/only_our_subjects in config/collector.yaml), which also covers
+    # whatever this stack's other two daemons start emitting. Noted here because
+    # this is where you would look. [LAW:single-enforcer]
     metrics:
       readers:
         - pull:

@@ -29,7 +29,7 @@ To prove the whole path works before you trust it:
 ./ct verify
 ```
 
-Three stages, cheapest first. It checks the label encoding without touching the network.
+Four stages, cheapest first. It checks the label encoding without touching the network.
 It sends a synthetic trace, metric and log through the collector and waits for all four
 sinks to hand them back. Then it runs a real one-prompt session through the launcher and
 waits for that session in the same four — plus a Jaeger tag search on the labels it was
@@ -37,7 +37,15 @@ launched with, a ClickHouse row whose promoted columns are populated rather than
 present, the tokens that session spent being attributable to the tool call it made, and
 every one of its requests carrying a price so the session has a cost in dollars.
 
-One last check runs only if it applies: where a [`lit`](#how-many-turns-a-ticket-took-and-what-it-cost)
+The last stage asks the opposite question of the other three: not whether your data
+arrived, but whether anything else did. It counts the spans in the store from a service
+that is neither Claude Code nor verify's own probe, before the run and after, and fails if
+the number moved. Jaeger self-traces its own query API — which verify polls dozens of
+times per run — so without something stopping it the stack quietly files about a hundred
+spans about itself per verify, and "how big is my history" answers wrong for a year. The
+collector drops them on the way in; this stage is what would notice if it stopped.
+
+One further check runs only if it applies: where a [`lit`](#how-many-turns-a-ticket-took-and-what-it-cost)
 workspace answers, verify confirms its history still parses and its actors are still
 session ids spans can be joined on. With no `lit`, no tickets in it, or no ticket a Claude
 session has moved — including a checkout nobody ran `lit init` in — it says so and carries
@@ -50,7 +58,7 @@ that is something that used to work and stopped. The other is everything downstr
 at the old workspace, an export whose shape or actor format has drifted out from under the
 views. Those are loud by design; the message for each names what to go look at.
 
-Each stage picks a session id before it emits anything and then asks every sink for that
+Each stage that emits anything picks a session id first and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still
 lying around. Nothing the stack writes sits outside that check: break any one exporter
 and verify goes red naming the sink that lost the run.

@@ -16,6 +16,51 @@ receivers:
         endpoint: 127.0.0.1:${env:CT_OTLP_HTTP_PORT}
 
 processors:
+  # [LAW:single-enforcer] The one place the stack refuses to record itself.
+  #
+  # Jaeger v2 self-traces its own query API straight back into this collector,
+  # and `ct verify` polls that API for up to 30s per sink check -- so every
+  # verify run used to bury roughly a hundred `/api/traces` spans in the store
+  # under ServiceName='jaeger', measured 2026-08-23 and again 2026-08-26. They
+  # answer no question the epic asks (no span.type, so llm_requests never sees
+  # them) and corrupt every question counted over claude.spans directly.
+  #
+  # This is where the rule is enforced because it is the only place all three
+  # signals cross on the way to all four sinks. The switch that looks like it
+  # should own this -- `service.telemetry.traces` in config/jaeger.yaml, or
+  # OTEL_TRACES_EXPORTER=none in jaeger's process environment -- was tried both
+  # ways and measured not to stop it. Enforcing per emitter is also N
+  # checkpoints for one rule, and this stack has three daemons that could each
+  # acquire self-telemetry in any release.
+  #
+  # Hence an allowlist rather than a drop-list of known offenders: the condition
+  # states what the sinks are FOR, so an emitter nobody has thought of yet is
+  # already excluded instead of pending a future edit. Failing closed is the
+  # point -- a drop-list fails open exactly when a component starts emitting,
+  # which is the day nobody is looking. [LAW:types-are-the-program]
+  #
+  # Not silent: `otelcol_processor_filter_datapoints_filtered` and its span and
+  # log siblings count every drop on the telemetry port
+  # (CT_COLLECTOR_TELEMETRY_PORT), so the rule reports what it is doing rather
+  # than data merely going missing. [LAW:no-silent-failure]
+  #
+  # error_mode: propagate is deliberate. A span with no resource service.name
+  # compares unequal to both names and is dropped, which is correct; what
+  # propagate additionally buys is that an OTTL statement this file gets WRONG
+  # in some future edit fails loudly at the processor instead of quietly
+  # deciding every span's fate.
+  filter/only_our_subjects:
+    error_mode: propagate
+    traces:
+      span:
+        - resource.attributes["service.name"] != "${env:CT_CLAUDE_SERVICE_NAME}" and resource.attributes["service.name"] != "${env:CT_SELFTEST_SERVICE}"
+    metrics:
+      datapoint:
+        - resource.attributes["service.name"] != "${env:CT_CLAUDE_SERVICE_NAME}" and resource.attributes["service.name"] != "${env:CT_SELFTEST_SERVICE}"
+    logs:
+      log_record:
+        - resource.attributes["service.name"] != "${env:CT_CLAUDE_SERVICE_NAME}" and resource.attributes["service.name"] != "${env:CT_SELFTEST_SERVICE}"
+
   # Small timeout: this is an interactive dev loop, so a span should be visible
   # in the UI a couple of seconds after the tool call finishes, not a minute.
   batch:
@@ -61,13 +106,19 @@ service:
   pipelines:
     # One stream, two sinks, and they are independent: if ClickHouse is down the
     # collector retries into it while Jaeger keeps receiving, and the reverse.
+    #
+    # All three pipelines run the same processors in the same order, and the
+    # filter comes first everywhere: what the stack refuses to record, it also
+    # refuses to batch. Only the traces pipeline has ever leaked, but a rule
+    # applied on the pipeline that happened to break is a rule the next
+    # pipeline gets to break too. [LAW:dataflow-not-control-flow]
     traces:
       receivers: [otlp]
-      processors: [batch]
+      processors: [filter/only_our_subjects, batch]
       exporters: [otlp_grpc/jaeger, clickhouse]
     metrics:
       receivers: [otlp]
-      processors: [batch]
+      processors: [filter/only_our_subjects, batch]
       exporters: [prometheus]
     # Events go to the same store as the spans, and so inherit the same one-year
     # TTL rather than carrying a rotation count of their own. The file exporter
@@ -76,7 +127,7 @@ service:
     # in the events table's comment in config/clickhouse.yaml.
     logs:
       receivers: [otlp]
-      processors: [batch]
+      processors: [filter/only_our_subjects, batch]
       exporters: [clickhouse]
   telemetry:
     resource:
