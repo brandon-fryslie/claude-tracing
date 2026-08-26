@@ -126,8 +126,18 @@ ct_process_gone() { ! kill -0 "$1" 2>/dev/null; }
 # waits without a bound; this is what lets that stay true for an external command
 # that has no timeout flag of its own.
 ct_run_bounded() {
-  local seconds="$1" worker timer status
+  local seconds="$1" worker timer status fired
   shift
+  # The timer records that it acted, and the caller reads that rather than
+  # inferring it. "Died from a signal" and "we stopped it" are different facts
+  # and 128+signal cannot tell them apart: a worker that segfaults in its first
+  # second looks exactly like one killed at the bound, so a caller reading the
+  # exit code alone reports an instant crash as a 60s hang. Elapsed time would
+  # be the same guess wearing a clock. [LAW:no-ambient-temporal-coupling]
+  #
+  # mktemp creates it, so nothing in a shared /tmp can be pointed at; the flag
+  # is the file being non-empty, which only this timer writes.
+  fired="$(mktemp "${TMPDIR:-/tmp}/ct_bound.XXXXXX")"
   # `set -m` for the launch and nothing else. Without job control a background
   # job inherits ct's own process group, which makes a group signal a suicide
   # note; with it the worker leads a group of its own, so the group is both the
@@ -162,6 +172,7 @@ ct_run_bounded() {
   # entire bound: measured at 60s for a command that exited in 0s, and 0s for
   # the identical call left uncaptured. The bound silently became the latency.
   { sleep "$seconds"
+    printf 1 > "$fired"
     kill -TERM -- -"$worker" 2>/dev/null
     sleep "$KILL_GRACE_SECONDS"
     kill -KILL -- -"$worker" 2>/dev/null
@@ -178,6 +189,12 @@ ct_run_bounded() {
   # its own by now, and a kill that finds nothing to kill is the expected case
   # rather than a fault. Nothing downstream reads this outcome.
   kill -TERM "$timer" 2>/dev/null || :
+  # 124, the status timeout(1) reports for the same event, so a caller that
+  # already knows that convention needs no local one. It replaces the worker's
+  # own status rather than sitting beside it: once we killed it, whatever it
+  # exited with is an artefact of the killing, not news about the work.
+  if [ -s "$fired" ]; then status=124; fi
+  rm -f "$fired"
   return "$status"
 }
 
@@ -312,46 +329,54 @@ EOF
 # interpolated so a workspace path never becomes part of the script text.
 # shellcheck disable=SC2016  # $1 is for the inner bash to expand, deliberately
 ct_lit_status() {
-  local complaint status
+  local complaint status gitdir
   # Three ways for there to be nothing here, and they are one fact: no lit to
   # ask, nowhere to ask it about, or a workspace nobody ever ran `lit init` in.
   #
   # That third one is not pedantry. lit lives on developers' PATHs for other
-  # repos, and the DEFAULT workspace is this checkout -- whose store is under
-  # .git/links and so is never cloned. Without this arm, the fresh-clone
-  # Quickstart hard-fails for anyone who happens to have lit installed:
-  # `lit export` exits 1 ("links requires running inside a git repository/
-  # worktree with links initialized"), which is indistinguishable from a real
-  # breakage unless we ask first whether there was ever a store to break.
-  # Nothing ever worked here, so nothing stopped working.
+  # repos, and the DEFAULT workspace is this checkout -- whose store is never
+  # cloned. Without this arm, the fresh-clone Quickstart hard-fails for anyone
+  # who happens to have lit installed: `lit export` exits 1 ("links requires
+  # running inside a git repository/worktree with links initialized"), which is
+  # indistinguishable from a real breakage unless we ask first whether there was
+  # ever a store to break. Nothing ever worked here, so nothing stopped working.
   #
-  # .git/links is lit's layout rather than ours, named here because the README
-  # and this file already document it. If lit relocates its store this check
-  # starts answering `absent` for a workspace that has one -- verify skips the
-  # join and says so, which is the pre-existing behaviour and the safe
-  # direction to be wrong in. It cannot turn into a false failure.
-  { command -v lit >/dev/null \
-      && [ -d "$CT_LIT_WORKSPACE" ] \
-      && [ -d "$CT_LIT_WORKSPACE/.git/links" ]; } \
+  # git is asked where the store would be rather than told. `<workspace>/.git`
+  # is a DIRECTORY only in an ordinary checkout; in a worktree it is a file
+  # holding a gitdir pointer, so testing `.git/links` there is false however
+  # well lit is set up -- and the README invites pointing CT_LIT_WORKSPACE at
+  # another checkout, worktrees included. Measured: `lit init` in a worktree
+  # succeeds and puts its store in the COMMON git dir, so that is the one to
+  # look in. A directory that is no git repository at all fails rev-parse and
+  # lands here too, which is right for a tool that requires one.
+  { command -v lit >/dev/null && [ -d "$CT_LIT_WORKSPACE" ]; } \
     || { printf 'absent'; return 0; }
+  gitdir="$(git -C "$CT_LIT_WORKSPACE" rev-parse --path-format=absolute \
+              --git-common-dir 2>/dev/null)" \
+    || { printf 'absent'; return 0; }
+  [ -d "$gitdir/links" ] || { printf 'absent'; return 0; }
   # stdout dropped, stderr kept -- the export itself is not wanted here, only
   # whether producing it worked and, when it did not, what lit said about it.
   # Discarding both is what left the old version with nothing to report.
   complaint="$(ct_run_bounded "$CT_LIT_TIMEOUT_SECONDS" \
                  bash -c 'cd "$1" && lit export' _ "$CT_LIT_WORKSPACE" 2>&1 >/dev/null)" \
     && status=0 || status=$?
-  # One status, three readings. A worker the bound had to kill exits 128+signal
-  # and typically says nothing before it goes, so quoting its stderr quotes a
-  # blank line at the exact moment the useful fact -- that it hung until it was
-  # killed -- is already known right here. A hang gets reported as a hang.
-  # [LAW:no-silent-failure]
+  # One status, four readings, and no arm that can render `broken` followed by
+  # nothing -- which is the whole reason this reports a value rather than a
+  # boolean. 124 is ct_run_bounded saying it did the killing, so a hang is
+  # reported as a hang; a worker that hung says nothing before it goes, and
+  # quoting its empty stderr would throw away the one fact worth having. An
+  # ordinary failure that also said nothing gets its status named instead of a
+  # blank line. [LAW:no-silent-failure]
   if [ "$status" -eq 0 ]; then
     printf 'ready'
-  elif [ "$status" -ge 128 ]; then
+  elif [ "$status" -eq 124 ]; then
     printf 'broken\tno answer within %ss; it was still running and had to be killed' \
            "$CT_LIT_TIMEOUT_SECONDS"
-  else
+  elif [ -n "$complaint" ]; then
     printf 'broken\t%s' "$complaint"
+  else
+    printf 'broken\t(lit exited %s without writing anything to stderr)' "$status"
   fi
 }
 
