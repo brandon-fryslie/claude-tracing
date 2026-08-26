@@ -402,8 +402,11 @@ ct_stop_service() {
   if [ -n "$pid" ]; then
     # TERM and no further, unlike ct_record_pid: a service that will not stop
     # keeps its pidfile, so it stays visible to './ct status' and the operator
-    # decides what to do about it. Escalating to KILL here would take ClickHouse
-    # down in the middle of closing its parts to save ct ten seconds.
+    # decides what to do about it. Escalating buys no time here -- the TERM
+    # bound has already been waited out by the time it would run -- so the whole
+    # trade is a message the operator must read against ClickHouse killed in the
+    # middle of closing its parts. ct_record_pid escalates because there the
+    # message has nothing to point at: no record, no pid to find it by later.
     ct_signal_until_gone TERM "$pid" "$STOP_TIMEOUT_SECONDS" \
       || ct_die "$name (pid $pid) is still running ${STOP_TIMEOUT_SECONDS}s
   after SIGTERM. Its pidfile is left in place, so it is still visible to
