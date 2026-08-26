@@ -444,8 +444,8 @@ ct_stop_service() {
   was refused, kill's own message is directly above this one. Its pidfile is
   left in place, so './ct status' still sees it and './ct up' will not start a
   second copy of it.
-  This ends the run, so ct never reached the services after this one and does
-  not know their state. './ct status' is the only thing that does."
+  ct stops at the first service it cannot stop, so nothing after this one was
+  signalled. './ct status' is the only account of what is still up."
     ct_ok "$name stopped"
   else
     ct_info "$name not running"
