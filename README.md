@@ -128,6 +128,13 @@ anything else this repo has no probe for:
 OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=staging ./ct claude
 ```
 
+**If you have `OTEL_RESOURCE_ATTRIBUTES=session.purpose=…` in a shell rc, drop it** — this
+is where that used to be documented, and `CT_SESSION_PURPOSE` is now the one place the key
+is set. Setting both is not fatal: measured against Claude Code 2.1.226, a key appearing
+twice in the merged string is last-wins and the rest of the set survives, and `ct claude`
+appends what it derives after what you passed in, so `CT_SESSION_PURPOSE` wins. It's still
+two places to change one fact, and only one of them is the one the table above describes.
+
 One warning, measured rather than assumed: a single raw space anywhere in
 `OTEL_RESOURCE_ATTRIBUTES` makes Claude Code discard *every* attribute in the string,
 silently, including the well-formed ones beside it. `ct claude` percent-encodes what it
@@ -536,8 +543,8 @@ whole reason the label exists:
 ```bash
 ./ct sql "SELECT Model, count() AS sessions, round(avg(Turns), 1) AS turns_to_converge
           FROM (SELECT SessionId,
-                       argMax(Model, OutputTokens) AS Model,
-                       countIf(InvokedModel)       AS Turns
+                       argMax(Model, MainLoopOutputTokens) AS Model,
+                       countIf(InvokedModel)               AS Turns
                 FROM claude.session_turns
                 WHERE Purpose = 'code-review'
                 GROUP BY SessionId)
@@ -547,9 +554,13 @@ whole reason the label exists:
 Two choices in there that decide what the number means. `countIf(InvokedModel)` counts only
 the turns that actually invoked a model, so the local slash commands and interrupted lines
 every session ends on don't inflate the count. And a session's model is `argMax(Model,
-OutputTokens)` — the model that wrote the most, mirroring how a *turn* picks its model —
-because a session that switched models partway is one session, not two, and counting it
-under both would make each look faster than it was.
+MainLoopOutputTokens)` — because a session that switched models partway is one session, not
+two, and counting it under both would make each look faster than it was.
+
+`MainLoopOutputTokens` and not `OutputTokens`, and the difference is not pedantic: it is the
+same weight a *turn* uses to pick its own model, so the two grains answer "which model drove
+this" by one rule. Weighting by total output instead counts subagent work as main-loop work,
+and one turn that spawned a large subagent could decide the model of the entire session.
 
 **It answers with no rows today**, which is not a bug in the query and can't be fixed by
 one: `Purpose` is stamped at launch and cannot be backfilled, so the results start

@@ -461,7 +461,17 @@ startup_scripts:
           -- Model                       EffectiveFrom          Input  CacheRead  CacheCreation  Output
           ('claude-opus-5[1m]',          toDate('2026-08-23'),    5.0,       0.5,          10.0,   25.0),
           ('claude-opus-5',              toDate('2026-08-23'),    5.0,       0.5,          10.0,   25.0),
-          ('claude-haiku-4-5-20251001',  toDate('2026-08-23'),    1.0,       0.1,           2.0,    5.0)
+          ('claude-haiku-4-5-20251001',  toDate('2026-08-23'),    1.0,       0.1,           2.0,    5.0),
+          -- Measured 2026-08-26 by the procedure in docs/analytics-findings.md,
+          -- not copied from a price list: two independent Sonnet 5 series on the
+          -- live scrape surface reconciled to their cost counters exactly
+          -- (residuals 0 and 3e-17, the float64's own rounding). Added because
+          -- `ct verify` began reporting every request of its probe session
+          -- unpriced -- Claude Code picks the model, and it picked this one --
+          -- and an unpriced request costs a confident zero dollars.
+          -- Cache creation lands at 2x input, the same 1-hour-TTL multiple both
+          -- Opus rows carry, rather than the 1.25x of the 5-minute cache.
+          ('claude-sonnet-5',            toDate('2026-08-26'),    3.0,       0.3,           6.0,   15.0)
         )
 
     # The other thing the flat table cannot express: what a request had to do with
@@ -913,6 +923,14 @@ startup_scripts:
           worked.Model         AS Model,
           worked.Requests      AS Requests,
           worked.OutputTokens  AS OutputTokens,
+          -- The weight behind Model, exposed rather than kept inside because a
+          -- caller asking the same question one grain up -- which model drove
+          -- this SESSION -- needs the same weight to get a consistent answer.
+          -- Weighting that argMax by OutputTokens instead reads subagent bursts
+          -- as main-loop work, so one turn that spawned a large subagent can
+          -- decide the model of the whole session. Same question, one
+          -- definition. [LAW:one-source-of-truth]
+          worked.MainLoopOutput AS MainLoopOutputTokens,
           worked.TotalTokens   AS TotalTokens,
           -- Never multiply TotalTokens by a rate: the four counts bill at rates
           -- spanning 50x. This is the sum of what each request already cost.
@@ -934,6 +952,10 @@ startup_scripts:
             argMax(Model, MainLoopOutputTokens) AS Model,
             sum(Requests)     AS Requests,
             sum(OutputTokens) AS OutputTokens,
+            -- Not aliased back to MainLoopOutputTokens: ClickHouse resolves an
+            -- alias that shadows the column it aggregates to itself, and
+            -- rejects the whole view as an aggregate inside an aggregate.
+            sum(MainLoopOutputTokens) AS MainLoopOutput,
             sum(TotalTokens)  AS TotalTokens,
             sum(CostUSD)      AS CostUSD,
             sum(Unpriced)     AS Unpriced
