@@ -209,6 +209,146 @@ startup_scripts:
         TTL toDateTime(Timestamp) + INTERVAL 1 YEAR
         SETTINGS ttl_only_drop_parts = 1
 
+    # --- events ----------------------------------------------------------
+    # The logs signal. Some of it restates what spans already carry -- the prompt
+    # text is a `user_prompt` attribute on the interaction span, so read it there
+    # -- and some of it has no span at all: api_error, api_retries_exhausted,
+    # hook executions, plugin and MCP loads, skill activations, subagent
+    # completions. That second list is why deleting this pipeline was the wrong
+    # answer to the retention question below.
+    #
+    # THE CANONICAL RETENTION ARITHMETIC. Stated once, here, next to the table it
+    # justifies; lib/common.sh, config/collector.yaml and the README point at
+    # this block rather than restating it, because four copies of one derivation
+    # are four chances to correct one and leave three lying.
+    # [LAW:one-source-of-truth]
+    #
+    #   measured   4,798 records over 82.2 h = 9,100,461 bytes of OTLP JSON
+    #              ~1.9 KB a record, ~12.8 KB per tool call
+    #   scaled     41,341 tool calls a month (the epic's measured baseline)
+    #              -> ~500 MB of JSON a month
+    #   the file   max_megabytes 64, max_backups 3 -- the active file plus three
+    #              backups, so 256 MB total, or ABOUT TWO WEEKS, after which the
+    #              oldest went out with no error and no log line
+    #   here       the same 4,798 records occupy 580 KiB on disk, a factor of 15,
+    #              putting a year under 400 MB
+    #
+    # The factor of 15 is not luck: ~60% of every record is the same identity
+    # block (user.email, user.id, organization.id) repeated verbatim, which is
+    # nearly free once dictionary-encoded and is paid for in full in JSON.
+    # Re-derive the last line with:
+    #   SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows)
+    #   FROM system.parts WHERE database='claude' AND table='events' AND active
+    #
+    # Columns down to EventName are the exporter's logs INSERT contract, captured
+    # by letting it create its own table and reading the result back, the same way
+    # and for the same reason as the spans table above. The eight
+    # __otel_materialized_k8s.* columns it also generates are omitted: they are
+    # MATERIALIZED, so the exporter cannot name them in an INSERT, and none of
+    # this runs in Kubernetes.
+    - query: |
+        CREATE TABLE IF NOT EXISTS claude.events
+        (
+          Timestamp          DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+          TraceId            String CODEC(ZSTD(1)),
+          SpanId             String CODEC(ZSTD(1)),
+          TraceFlags         UInt8,
+          SeverityText       LowCardinality(String) CODEC(ZSTD(1)),
+          SeverityNumber     UInt8,
+          ServiceName        LowCardinality(String) CODEC(ZSTD(1)),
+          Body               String CODEC(ZSTD(1)),
+          ResourceSchemaUrl  LowCardinality(String) CODEC(ZSTD(1)),
+          ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+          ScopeSchemaUrl     LowCardinality(String) CODEC(ZSTD(1)),
+          ScopeName          String CODEC(ZSTD(1)),
+          ScopeVersion       LowCardinality(String) CODEC(ZSTD(1)),
+          ScopeAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+          LogAttributes      Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+
+          -- OTLP's own field for this, and Claude Code leaves it empty on every
+          -- record -- 2.1.226 puts the event name in Body instead. Kept because
+          -- it is part of the INSERT contract above, not because it answers
+          -- anything: query Body for the event name, never this.
+          EventName          String CODEC(ZSTD(1)),
+
+          -- Promoted out of the maps for the same reasons as on spans: computed
+          -- once at insert, real columns that can lead the sort key, originals
+          -- left in place. SessionId is the session-grain key -- the one every
+          -- join in this file already uses to reach spans, session_turns and
+          -- lit's ticket history.
+          --
+          -- It is NOT how you find the span an event fired inside: a session
+          -- holds thousands of spans, so an equi-join on SessionId alone is a
+          -- cross product. Use the SpanId column above for that -- it comes
+          -- straight from OTLP and Claude Code populates it on the events that
+          -- matter (tool_decision, tool_result, api_request: >99% non-empty on
+          -- this machine's data), so `events.SpanId = spans.SpanId` is the
+          -- per-event match and needs no time window.
+          SessionId          String MATERIALIZED LogAttributes['session.id'],
+
+          -- Stamped by `ct claude`, so sessions launched any other way have them
+          -- empty -- the same reading as on spans.
+          Repository         LowCardinality(String) MATERIALIZED ResourceAttributes['vcs.repository.name'],
+          Branch             LowCardinality(String) MATERIALIZED ResourceAttributes['vcs.ref.head.name'],
+
+          -- SpanId is the join key the comment above sends readers to, and it is
+          -- in neither the sort key nor any map index, so it gets its own -- the
+          -- same instrument and tolerance idx_trace_id uses on spans, for the
+          -- same reason: a per-row identifier is what a bloom filter is for.
+          --
+          -- What it buys is the POINT LOOKUP -- `WHERE SpanId = '...'`, which is
+          -- how you go from one span to the events inside it. It does not make
+          -- an unfiltered year-wide `events JOIN spans ON SpanId` cheap: a hash
+          -- join builds from one side and scans the other, and a skip index
+          -- prunes granules only when a WHERE selects them. Narrow first, then
+          -- join the remainder -- and note that each way of narrowing is pruned
+          -- by a different thing: Body by the sort key, a time range by the
+          -- monthly partitions, SessionId by its own index below.
+          INDEX idx_span_id        SpanId                        TYPE bloom_filter(0.001) GRANULARITY 1,
+
+          -- SessionId gets the same treatment, and it is not redundant with its
+          -- place in the sort key. The key is (Body, SessionId, Timestamp), so
+          -- rows are ordered by SessionId only WITHIN a Body group; a
+          -- `WHERE SessionId = '...'` that names no Body finds the sparse
+          -- primary index unable to prune, because a mark's SessionId range
+          -- spans most of the id space once Body is unconstrained. Measured
+          -- with EXPLAIN indexes = 1 -- the PrimaryKey condition engages and
+          -- keeps 4/4 granules, while this index takes the same query to 1/3.
+          -- "Everything session X logged" is the common interactive query, so
+          -- it is worth an index rather than a caveat.
+          INDEX idx_session_id     SessionId                     TYPE bloom_filter(0.001) GRANULARITY 1,
+
+          INDEX idx_log_attr_key   mapKeys(LogAttributes)        TYPE bloom_filter(0.01) GRANULARITY 1,
+          INDEX idx_log_attr_value mapValues(LogAttributes)      TYPE bloom_filter(0.01) GRANULARITY 1,
+          INDEX idx_res_attr_key   mapKeys(ResourceAttributes)   TYPE bloom_filter(0.01) GRANULARITY 1,
+          INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1
+        )
+        ENGINE = MergeTree
+
+        -- Monthly, matching spans, and against the exporter's own default of
+        -- daily -- which would stand up 365 partitions to answer twelve monthly
+        -- questions, and would make the TTL below evict a day at a time.
+        PARTITION BY toYYYYMM(Timestamp)
+
+        -- Body first because it holds the event name and every query starts by
+        -- naming one, exactly as SpanType leads the spans key. SessionId next so
+        -- that once a Body is named, one session's rows are contiguous rather
+        -- than scattered through the group -- which is what it buys, and all it
+        -- buys: a SessionId filter that names no Body prunes nothing here, and
+        -- is served by idx_session_id above instead. Timestamp last to order
+        -- within. The exporter's default leads with toStartOfFiveMinutes(
+        -- Timestamp) then ServiceName, and ServiceName holds one value here, so
+        -- as a sort key it sorts nothing.
+        ORDER BY (Body, SessionId, Timestamp)
+
+        -- The same year the spans get, stated the same way. The exporter creates
+        -- its logs table with no TTL at all, so inheriting its default would
+        -- have traded a ceiling that drops data early for one that never drops
+        -- it -- and left the two signals in one store disagreeing about how far
+        -- back "all of it" reaches. [LAW:one-source-of-truth]
+        TTL toDateTime(Timestamp) + INTERVAL 1 YEAR
+        SETTINGS ttl_only_drop_parts = 1
+
     # --- prices ---------------------------------------------------------
     # No span carries a cost. Claude Code emits dollars only on the metrics
     # signal, at session grain and onto a Prometheus scrape surface that forgets

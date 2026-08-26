@@ -407,7 +407,7 @@ cmd_up() {
   ct_info "OTLP in    127.0.0.1:$CT_OTLP_GRPC_PORT (gRPC)  127.0.0.1:$CT_OTLP_HTTP_PORT (HTTP)"
   ct_info "SQL        ./ct sql 'SELECT count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE'"
   ct_info "Metrics    http://127.0.0.1:$CT_CLAUDE_METRICS_PORT/metrics"
-  ct_info "Events     $CT_LOG_DIR/claude-events.jsonl"
+  ct_info "Events     ./ct sql 'SELECT Body, SessionId FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_EVENTS_TABLE ORDER BY Timestamp DESC LIMIT 10'"
   echo
   ct_trace "Next:  cd to the repo you want to trace, then:  $CT_ROOT/ct claude"
 }
@@ -724,12 +724,18 @@ metrics_has_run() {
     curl -fs --max-time 5 "http://127.0.0.1:$CT_CLAUDE_METRICS_PORT/metrics"
 }
 
-# grep against the file rather than a captured copy: this one grows to 64 MB
-# before the exporter rotates it, and reading that into a shell variable sixty
-# times over a poll would be the expensive way to ask a cheap question. -s
-# because a missing file is the answer being computed, not a failure being
-# hidden -- the enforcer below is what reports it, by name.
-events_has_run() { grep -qsF -- "$2" "$CT_LOG_DIR/claude-events.jsonl"; }
+# Events land in ClickHouse beside the spans, so this asks the same store the
+# same way clickhouse_has_run does -- but of a different table, fed by a
+# different pipeline. That is what keeps it a separate sink worth polling: the
+# logs pipeline can stop delivering while the traces pipeline keeps going, and a
+# check that only queried claude.spans would call that healthy.
+#
+# SessionId is MATERIALIZED from LogAttributes['session.id'], which is where
+# selftest_log puts the needle, so nothing about the payload has to change here.
+events_has_run() {
+  clickhouse_returns_a_row \
+    "SELECT Timestamp FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_EVENTS_TABLE WHERE SessionId = '$2'"
+}
 
 # [LAW:one-type-per-behavior] Every sink is the same kind of thing: a place a
 # signal lands, and a question whose answer means "this run's data is here". What
@@ -744,7 +750,7 @@ ct_sinks() {
 jaeger|jaeger_has_run|The collector accepted the span, so its otlp_grpc/jaeger exporter or badger is what did not; jaeger.log has the storage side.
 clickhouse|clickhouse_has_run|Likeliest cause is the exporter's INSERT no longer matching the table in config/clickhouse.yaml -- a collector upgrade that adds a column does exactly this; clickhouse.log has the rejection.
 metrics|metrics_has_run|An empty scrape body means the metrics pipeline delivered nothing at all; a body naming other sessions means this run's metrics alone went missing.
-events|events_has_run|The file/events exporter writes var/log/claude-events.jsonl directly, so an unchanged file means the logs pipeline itself is gone.
+events|events_has_run|Spans and events share one exporter and one store, so if the clickhouse sink above passed and this did not, the fault is the logs pipeline or the claude.events table specifically -- likeliest an exporter upgrade whose logs INSERT no longer matches the columns in config/clickhouse.yaml; clickhouse.log has the rejection.
 EOF
 }
 

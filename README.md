@@ -131,16 +131,28 @@ two thirds of the telemetry disappears without anyone telling you. The collector
 to give each signal a real sink:
 
 ```
-claude  ──OTLP/gRPC──▶  collector :4317  ──traces──┬▶ jaeger :14317 ──▶ badger    7 days
-                                                   └▶ clickhouse :9000 ──▶ SQL    1 year
+claude  ──OTLP/gRPC──▶  collector :4317  ──traces──┬▶ jaeger :14317 ──▶ badger        7 days
+                                                   └▶ clickhouse :9000 ──▶ claude.spans   1 year
                                          ──metrics─▶  :8889/metrics (Prometheus format)
-                                         ──logs────▶  var/log/claude-events.jsonl
+                                         ──logs────▶  clickhouse :9000 ──▶ claude.events  1 year
 ```
 
 Traces go to two sinks because they answer two different questions. Badger is what
 Jaeger reads to draw one trace, and it holds a week. ClickHouse holds a year and answers
 `sum(tokens) group by month`. Neither depends on the other: if the ClickHouse path
 breaks, viewing still works, and the reverse.
+
+Logs — Claude Code calls them events — go to ClickHouse rather than to a file, and they
+land beside the spans so both signals expire on one clause instead of a TTL for one and a
+rotation count for the other. Some of what `claude.events` holds also lives on the spans
+(prompt text is a `user_prompt` attribute on the interaction span, so read it there), and
+some has no span at all: `api_error`, `api_retries_exhausted`, hook executions, plugin and
+MCP loads, skill activations, subagent completions.
+
+To go from an event to the span it fired inside, join on `SpanId` — Claude Code populates
+it on the events that matter. `SessionId` is the session-grain key both tables materialize;
+joining on it alone gives every event against every span in the session, which is a cross
+product, not a match.
 
 Jaeger 2.20 does ship its own ClickHouse backend, and this deliberately doesn't use it —
 the binary prints `WARNING: ClickHouse Storage is Experimental` on the way up, and
@@ -525,10 +537,22 @@ days under `var/jaeger` (`CT_TRACE_TTL` in `lib/common.sh`); ClickHouse keeps a 
 `@from_env` because ClickHouse substitutes whole values, never pieces of a query). Both
 survive restarts. To start either one clean, `./ct down` and delete its directory.
 
-A year is expected to land in 150–400 MB. That estimate is reasoned rather than measured
-— about 60% of every span is the same identity block repeated verbatim, which a columnar
-store collapses to almost nothing — so check it rather than trust it once there's a real
-year in there.
+A year of spans is expected to land in 150–400 MB. That estimate is reasoned rather than
+measured — about 60% of every span is the same identity block repeated verbatim, which a
+columnar store collapses to almost nothing — so check it rather than trust it once there's
+a real year in there.
+
+For events the same collapse has been measured rather than reasoned, and the outcome is
+that the file sink this replaced held **about two weeks** — not a year — before dropping
+the oldest data with no error and no log line, while the same year fits in **under 400 MB**
+as a table. The arithmetic behind both numbers is stated once, in the `claude.events`
+comment in `config/clickhouse.yaml`; it is not repeated here, so re-measuring only ever
+has one place to correct. Re-measure with:
+
+```bash
+./ct sql "SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows)
+          FROM system.parts WHERE database='claude' AND table='events' AND active"
+```
 
 Everything under `var/` is disposable and gitignored — binaries, pidfiles, logs, and
 storage all come back from `./ct up`.
