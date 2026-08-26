@@ -300,10 +300,23 @@ startup_scripts:
           -- how you go from one span to the events inside it. It does not make
           -- an unfiltered year-wide `events JOIN spans ON SpanId` cheap: a hash
           -- join builds from one side and scans the other, and a skip index
-          -- prunes granules only when a WHERE selects them. Filter by Body,
-          -- SessionId or a time range first -- the sort key and the monthly
-          -- partitions prune those -- and join the remainder.
+          -- prunes granules only when a WHERE selects them. Narrow first, then
+          -- join the remainder -- and note that each way of narrowing is pruned
+          -- by a different thing: Body by the sort key, a time range by the
+          -- monthly partitions, SessionId by its own index below.
           INDEX idx_span_id        SpanId                        TYPE bloom_filter(0.001) GRANULARITY 1,
+
+          -- SessionId gets the same treatment, and it is not redundant with its
+          -- place in the sort key. The key is (Body, SessionId, Timestamp), so
+          -- rows are ordered by SessionId only WITHIN a Body group; a
+          -- `WHERE SessionId = '...'` that names no Body finds the sparse
+          -- primary index unable to prune, because a mark's SessionId range
+          -- spans most of the id space once Body is unconstrained. Measured
+          -- with EXPLAIN indexes = 1 -- the PrimaryKey condition engages and
+          -- keeps 4/4 granules, while this index takes the same query to 1/3.
+          -- "Everything session X logged" is the common interactive query, so
+          -- it is worth an index rather than a caveat.
+          INDEX idx_session_id     SessionId                     TYPE bloom_filter(0.001) GRANULARITY 1,
 
           INDEX idx_log_attr_key   mapKeys(LogAttributes)        TYPE bloom_filter(0.01) GRANULARITY 1,
           INDEX idx_log_attr_value mapValues(LogAttributes)      TYPE bloom_filter(0.01) GRANULARITY 1,
@@ -318,10 +331,14 @@ startup_scripts:
         PARTITION BY toYYYYMM(Timestamp)
 
         -- Body first because it holds the event name and every query starts by
-        -- naming one, exactly as SpanType leads the spans key; SessionId next so
-        -- "everything session X logged" stays a seek. The exporter's default
-        -- leads with toStartOfFiveMinutes(Timestamp) then ServiceName, and
-        -- ServiceName holds one value here, so as a sort key it sorts nothing.
+        -- naming one, exactly as SpanType leads the spans key. SessionId next so
+        -- that once a Body is named, one session's rows are contiguous rather
+        -- than scattered through the group -- which is what it buys, and all it
+        -- buys: a SessionId filter that names no Body prunes nothing here, and
+        -- is served by idx_session_id above instead. Timestamp last to order
+        -- within. The exporter's default leads with toStartOfFiveMinutes(
+        -- Timestamp) then ServiceName, and ServiceName holds one value here, so
+        -- as a sort key it sorts nothing.
         ORDER BY (Body, SessionId, Timestamp)
 
         -- The same year the spans get, stated the same way. The exporter creates
