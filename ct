@@ -245,15 +245,52 @@ ct_start_service() {
 # Its own function so the choice is reachable without launching a daemon to
 # reach it: the failing arm needs a run dir that cannot be written, and that is
 # a value to pass, not a state to arrange around a real service.
+# The escalation is what makes the sentence above true rather than hopeful: a
+# signal sent is not a process gone, and this one has no record, so nothing will
+# ever find it again if it outlives us. TERM first and bounded by the same
+# STOP_TIMEOUT_SECONDS `./ct down` gives a service -- ClickHouse is named in that
+# constant's comment as the one that needs it -- then KILL, which cannot be
+# declined. If it is somehow still there after both, that is what the operator
+# is told, because at that point the promise is broken and saying otherwise
+# would be the lie this whole change exists to remove. [LAW:no-silent-failure]
+#
+# `ct_stop_service` deliberately does NOT escalate, and the difference is policy
+# rather than oversight: a service that outlasts `./ct down` still has its
+# pidfile, so it is visible and the operator can act, and SIGKILL would take
+# ClickHouse down mid-flush. Here there is no such fallback to preserve.
 ct_record_pid() {
   local name="$1" pid="$2"
   printf '%s\n' "$pid" > "$(ct_pidfile "$name")" && return 0
-  kill "$pid"
+  ct_signal_until_gone TERM "$pid" "$STOP_TIMEOUT_SECONDS" \
+    || ct_signal_until_gone KILL "$pid" "$KILL_GRACE_SECONDS" \
+    || ct_die "$name started as pid $pid, its pidfile could not be written to
+  $(ct_pidfile "$name"), and it survived both TERM and KILL. It is running now
+  and nothing records it: find it with 'ps -p $pid' and stop it by hand."
   ct_die "$name started as pid $pid but $(ct_pidfile "$name") could not be
   written -- killed it rather than leave a process nothing can see."
 }
 
 ct_process_gone() { ! kill -0 "$1" 2>/dev/null; }
+
+# Signals a pid and waits for it to stop existing. True when it is gone.
+#
+# One answer, because "is it still there" is the only fact either caller acts
+# on: a signal that was refused and a signal that was ignored leave the same
+# world behind, and splitting them would give every caller two arms that do the
+# same thing. What the answer MEANS differs by caller -- one leaves a record and
+# reports, the other escalates -- so that stays with the callers and only the
+# question is shared. [LAW:single-enforcer]
+#
+# `kill`s stderr is deliberately not discarded. The benign race it would hide --
+# a process exiting between ct_pid_of's own kill -0 and this signal -- is
+# microseconds wide, while the failure it would also hide (EPERM, a pid this
+# user may not signal) is the one thing an operator staring at a service that
+# will not stop needs to see. [LAW:no-silent-failure]
+ct_signal_until_gone() {
+  local signal="$1" pid="$2" seconds="$3"
+  kill -"$signal" "$pid" || ct_process_gone "$pid" || return 1
+  ct_poll_until "$seconds" ct_process_gone "$pid"
+}
 
 # Run a command with an upper bound on how long it may take, returning its own
 # exit status, or a failure if the bound was reached.
@@ -363,19 +400,14 @@ ct_stop_service() {
   local name="$1" pid
   pid="$(ct_pid_of "$name")"
   if [ -n "$pid" ]; then
-    # A process that exits between the read above and this signal has done what
-    # we asked of it, so a failing `kill` is only news if it is still there --
-    # which is what the second test asks and what the message reports. Its
-    # stderr is discarded because in the tolerated case it says exactly that
-    # ("no such process"), which is the answer being computed here rather than
-    # a fault being hidden: any other reason still reaches the operator, as a
-    # named service and pid that ct then refuses to call stopped.
-    # [LAW:no-silent-failure]
-    kill "$pid" 2>/dev/null || ct_process_gone "$pid" \
-      || ct_die "$name (pid $pid) could not be signalled and is still running"
-    ct_poll_until "$STOP_TIMEOUT_SECONDS" ct_process_gone "$pid" \
-      || ct_die "$name (pid $pid) ignored SIGTERM for ${STOP_TIMEOUT_SECONDS}s.
-  Its pidfile is left in place, so it is still visible to './ct status'."
+    # TERM and no further, unlike ct_record_pid: a service that will not stop
+    # keeps its pidfile, so it stays visible to './ct status' and the operator
+    # decides what to do about it. Escalating to KILL here would take ClickHouse
+    # down in the middle of closing its parts to save ct ten seconds.
+    ct_signal_until_gone TERM "$pid" "$STOP_TIMEOUT_SECONDS" \
+      || ct_die "$name (pid $pid) is still running ${STOP_TIMEOUT_SECONDS}s
+  after SIGTERM. Its pidfile is left in place, so it is still visible to
+  './ct status' and './ct up' will not start a second copy."
     ct_ok "$name stopped"
   else
     ct_info "$name not running"
@@ -838,14 +870,63 @@ verify_config_env_guard() {
   ct_ok "  the config-env guard reads both spellings and can tell exported from set"
 }
 
+# One fixture process behaving the way a row says, its pid on stdout. Shared by
+# both tables below, so the two halves of the invariant are exercised against
+# the same processes rather than two definitions of "a service that will not
+# stop" that can drift apart. [LAW:one-source-of-truth]
+#
+# Every fixture is launched with its output redirected, and that is load-bearing
+# rather than tidiness -- the same trap ct_run_bounded's timer documents. This
+# function prints through a command substitution, so its caller is waiting on
+# the PIPE and not on this function: a background fixture that inherited the
+# write end holds the caller for its entire lifetime. Measured before the
+# redirect went in: `./ct verify` hung, because a stage-1 assertion about
+# stopping a process was waiting on the process it had not stopped yet.
+ct_fixture_process() {
+  local how="$1" pid
+  case "$how" in
+    "exits on TERM")
+      sleep 600 >/dev/null 2>&1 & pid=$! ;;
+    # The failure both halves of the invariant are really about. The ignore is
+    # installed HERE, before the fork, and inherited -- POSIX carries an ignored
+    # disposition across both fork and exec, so the child holds it from its
+    # first instruction and there is no window in which a signal finds the
+    # default. A `trap "" TERM` inside the child instead is a race, and not a
+    # theoretical one: measured on 2026-08-26, the signal arrived before the
+    # child's own first line ran, killed it, and the row asserting that a
+    # service can refuse to stop reported that it had stopped.
+    # [LAW:no-ambient-temporal-coupling]
+    "ignores TERM")
+      trap '' TERM
+      sleep 600 >/dev/null 2>&1 & pid=$!
+      trap - TERM ;;
+    # Reaped before the row runs, so a pidfile naming it names a pid that is
+    # gone: the stale record a service leaves when it dies on its own.
+    "already exited")
+      bash -c 'exit 0' >/dev/null 2>&1 & pid=$!
+      wait "$pid" ;;
+    *) ct_die "no fixture here knows how to behave like '$how'" ;;
+  esac
+  printf '%s\n' "$pid"
+}
+
 # The up direction of the same invariant: a launch that cannot record its
 # process must not leave the process behind.
 #
-# Fields: what the run dir is|does the record succeed|is the process left running
+# The second row is the whole reason the first exists to be compared against,
+# and the third is what makes the promise more than a sent signal: a process
+# that declines TERM still has to be gone when ct_record_pid returns, so the row
+# fails unless the escalation to KILL actually happens. Each row carries the
+# bound its own TERM gets, because the constant a real service is owed is thirty
+# seconds and that is not a price stage 1 should pay to watch one fixture
+# refuse.
+#
+# Fields: how the fixture behaves|what the run dir is|TERM bound|does the record succeed|is the process left running
 ct_record_cases() {
   cat <<'EOF'
-a writable directory|yes|yes
-a path that is not a directory|no|no
+exits on TERM|a writable directory|5|yes|yes
+exits on TERM|a path that is not a directory|5|no|no
+ignores TERM|a path that is not a directory|1|no|no
 EOF
 }
 
@@ -861,46 +942,42 @@ ct_record_run_dir() {
     "a path that is not a directory")
       : > "$root/notadir"
       printf '%s\n' "$root/notadir" ;;
-    *) ct_die "ct_record_cases has a row nothing here knows how to build: '$how'" ;;
+    *) ct_die "ct_record_cases has a run dir nothing here knows how to build: '$how'" ;;
   esac
 }
 
 verify_start_service_record() {
-  local how records running root run_dir pid outcome output alive
+  local how where bound records running root run_dir pid outcome output alive
 
   root="$(mktemp -d)"
   [ -d "$root" ] || ct_die "mktemp -d produced no directory"
 
-  while IFS='|' read -r how records running; do
-    run_dir="$(ct_record_run_dir "$how" "$root")"
-    # Dropped from the jobs table, because half the rows end with this shell
-    # killing its own child and bash announces that as `Killed: 9` on stderr --
-    # a line that looks like a fault in the middle of a stage that is passing.
-    # Nothing here waits on the fixture; it is watched with kill -0.
-    sleep 600 >/dev/null 2>&1 & pid=$!
-    disown "$pid"
+  while IFS='|' read -r how where bound records running; do
+    run_dir="$(ct_record_run_dir "$where" "$root")"
+    pid="$(ct_fixture_process "$how")"
 
-    output="$(CT_RUN_DIR="$run_dir"; ct_record_pid fixture "$pid" 2>&1)" \
-      && outcome=yes || outcome=no
+    output="$(CT_RUN_DIR="$run_dir"; STOP_TIMEOUT_SECONDS="$bound"; \
+      ct_record_pid fixture "$pid" 2>&1)" && outcome=yes || outcome=no
 
-    # Both rows are read the same way and over the same interval, because "was
-    # it killed" is not observable at the instant of the call -- an immediate
+    # Every row is read the same way and over the same interval, because "was it
+    # killed" is not observable at the instant of the call -- an immediate
     # kill -0 sees a process the kernel has not finished reaping and calls a
     # successful kill a survivor. Two seconds is long enough for a signalled
     # `sleep` to be gone and short enough to be worth spending; an unsignalled
     # one is polled for the whole of it and is still there, which is the
-    # observation the first row needs rather than an absence of one.
+    # observation the surviving row needs rather than an absence of one.
     # [LAW:no-ambient-temporal-coupling]
     alive=yes
     if ct_poll_until 2 ct_process_gone "$pid"; then alive=no; fi
 
-    [ "$outcome" = "$records" ] || ct_die "recording a pid into $how should
-  have $([ "$records" = yes ] && printf 'succeeded' || printf 'failed'), and it did not. It said:
+    [ "$outcome" = "$records" ] || ct_die "recording the pid of a fixture that
+  '$how' into $where should have $([ "$records" = yes ] && printf 'succeeded' || printf 'failed'), and it did not. It said:
 $output"
-    [ "$alive" = "$running" ] || ct_die "after failing to record a pid into $how,
-  the process should $([ "$running" = yes ] || printf 'NOT ')still be running, and it is $alive.
+    [ "$alive" = "$running" ] || ct_die "after recording the pid of a fixture
+  that '$how' into $where, the process should $([ "$running" = yes ] || printf 'NOT ')still be running, and it is $alive.
   A launched daemon with no pidfile is one ct cannot report, cannot stop, and
-  will start a second copy of. It said:
+  will start a second copy of -- and a signal sent to it is not the same fact as
+  a process gone. It said:
 $output"
 
     if [ "$alive" = yes ]; then kill -KILL "$pid"; fi
@@ -924,69 +1001,44 @@ $output"
 # after `./ct down` -- an exit status and a file -- so a rewrite that keeps the
 # invariant passes unchanged.
 #
-# Fields: how the fixture behaves|stop bound|does the stop succeed|does the pidfile outlive it
+# Fields: how the fixture behaves|what pidfile names it|stop bound|does the stop succeed|does the pidfile outlive it
 ct_stop_cases() {
   cat <<'EOF'
-exits on TERM|5|yes|no
-ignores TERM|1|no|yes
-pidfile naming a process that already exited|5|yes|no
-no pidfile at all|5|yes|no
+exits on TERM|one naming it|5|yes|no
+ignores TERM|one naming it|1|no|yes
+already exited|one naming it|5|yes|no
+exits on TERM|none|5|yes|no
 EOF
 }
 
-# Makes one ct_stop_cases row true in $2 -- the pidfile that row describes, and,
-# when it describes a live one, the process it names -- and prints the pid, or
-# nothing when the row has no process. Removing the pidfile first is what lets
-# the rows run in any order: a row that says "no pidfile" has to mean it whether
-# or not the row above left one behind.
+# Makes one ct_stop_cases row true in $3: the process it describes, and the
+# pidfile it describes naming that process. The pid goes to stdout.
 #
-# Every fixture is launched with its output redirected, and that is load-bearing
-# rather than tidiness -- the same trap ct_run_bounded's timer documents. This
-# function prints through a command substitution, so the caller is waiting on
-# the PIPE and not on this function: a background fixture that inherited the
-# write end holds the caller for its entire lifetime. Measured before the
-# redirect went in: `./ct verify` hung, because a stage-1 assertion about
-# stopping a process was waiting on the process it had not stopped yet.
+# The last row has a process and no record of it rather than neither, which is
+# what lets every row leave exactly one pid for the caller to clean up and
+# spares the caller a "was there even a process" arm. Removing the pidfile first
+# is what lets the rows run in any order: a row that says "none" has to mean it
+# whether or not the row above left one behind.
 ct_stop_fixture() {
-  local how="$1" run_dir="$2" pid=''
+  local how="$1" record="$2" run_dir="$3" pid
   rm -f "$run_dir/fixture.pid"
-  case "$how" in
-    "exits on TERM")
-      sleep 600 >/dev/null 2>&1 & pid=$! ;;
-    # The failure the whole ordering exists for. The ignore is installed HERE,
-    # before the fork, and inherited -- POSIX carries an ignored disposition
-    # across both fork and exec, so the child holds it from its first
-    # instruction and there is no window in which a signal finds the default.
-    # A `trap "" TERM` inside the child instead is a race, and not a
-    # theoretical one: measured on 2026-08-26, ct_stop_service signalled the
-    # fixture before its own first line ran, killed it, and the row asserting
-    # that a service can refuse to stop reported that it had stopped.
-    # [LAW:no-ambient-temporal-coupling]
-    "ignores TERM")
-      trap '' TERM
-      sleep 600 >/dev/null 2>&1 & pid=$!
-      trap - TERM ;;
-    # Reaped before the row runs, so the pidfile names a pid that is gone: the
-    # stale record `ct up` leaves behind when a service dies on its own.
-    "pidfile naming a process that already exited")
-      bash -c 'exit 0' >/dev/null 2>&1 & pid=$!
-      wait "$pid" ;;
-    "no pidfile at all")
-      return 0 ;;
-    *) ct_die "ct_stop_cases has a row nothing here knows how to build: '$how'" ;;
+  pid="$(ct_fixture_process "$how")"
+  case "$record" in
+    "one naming it") printf '%s\n' "$pid" > "$run_dir/fixture.pid" ;;
+    "none") ;;
+    *) ct_die "ct_stop_cases asks for a pidfile nothing here knows how to make: '$record'" ;;
   esac
-  printf '%s\n' "$pid" > "$run_dir/fixture.pid"
   printf '%s\n' "$pid"
 }
 
 verify_stop_service_record() {
-  local how bound stops survives run_dir pid outcome output remains
+  local how record bound stops survives run_dir pid outcome output remains
 
   run_dir="$(mktemp -d)"
   [ -d "$run_dir" ] || ct_die "mktemp -d produced no directory"
 
-  while IFS='|' read -r how bound stops survives; do
-    pid="$(ct_stop_fixture "$how" "$run_dir")"
+  while IFS='|' read -r how record bound stops survives; do
+    pid="$(ct_stop_fixture "$how" "$record" "$run_dir")"
 
     # Its own subshell, for three reasons that are all the same reason: it must
     # survive a row whose expected outcome is ct_die's exit; CT_RUN_DIR must
@@ -1002,17 +1054,17 @@ verify_stop_service_record() {
     remains=no
     if [ -f "$run_dir/fixture.pid" ]; then remains=yes; fi
 
-    [ "$outcome" = "$stops" ] || ct_die "stopping a service that '$how' should
-  have $([ "$stops" = yes ] && printf 'succeeded' || printf 'failed'), and it did not. It said:
+    [ "$outcome" = "$stops" ] || ct_die "stopping a service that '$how' with
+  '$record' as its pidfile should have $([ "$stops" = yes ] && printf 'succeeded' || printf 'failed'), and it did not. It said:
 $output"
-    [ "$remains" = "$survives" ] || ct_die "after stopping a service that '$how',
-  the pidfile should $([ "$survives" = yes ] || printf 'NOT ')still be there, and it is $remains.
+    [ "$remains" = "$survives" ] || ct_die "after stopping a service that '$how'
+  with '$record' as its pidfile, it should $([ "$survives" = yes ] || printf 'NOT ')still be there, and it is $remains.
   A record removed while its process is alive is a daemon './ct status' calls
   stopped and './ct up' starts a second copy of, into a port the first one
   still holds. The fixture is left in $run_dir. It said:
 $output"
 
-    if [ -n "$pid" ] && ! ct_process_gone "$pid"; then kill -KILL "$pid"; fi
+    if ! ct_process_gone "$pid"; then kill -KILL "$pid"; fi
   done < <(ct_stop_cases)
   rm -rf "$run_dir"
 
