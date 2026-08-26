@@ -27,6 +27,19 @@ ct_probe_branch() { git branch --show-current 2>/dev/null || return 0; }
 
 ct_probe_cwd() { printf '%s\n' "$PWD"; }
 
+# What the session is FOR, which is the one work-unit fact nothing here can
+# derive: two sessions in the same checkout on the same branch, one writing the
+# change and one reviewing it, are identical to every probe above. So this one
+# reads the answer from the environment -- the only place the fact exists at
+# launch -- and, like the others, prints nothing when there is nothing to say.
+#
+# [LAW:no-mode-explosion] A purpose, not a `review=true`. A boolean answers one
+# question and forces a new attribute for the next category, which means a new
+# column and an edit to every query that groups by category. A purpose admits
+# categories as data: "were the docs sessions cheaper" costs a new VALUE and no
+# change to this file, the schema, or any query already written.
+ct_probe_session_purpose() { printf '%s\n' "${CT_SESSION_PURPOSE:-}"; }
+
 # --- the label set ----------------------------------------------------------
 # [LAW:one-type-per-behavior] Every row is the same kind of thing -- a key, and
 # something that prints its value -- so adding a label is adding a row, never a
@@ -37,9 +50,15 @@ ct_probe_cwd() { printf '%s\n' "$PWD"; }
 # A year of recorded history is expensive to rename, and vcs.* / process.* are
 # already understood by anything else that reads OTel.
 #
+# `session.purpose` is a coinage where the other three are OTel semantic
+# conventions, because the conventions have no key for it. It is named to sit
+# beside `session.id`, which Claude Code already stamps on every span: same
+# subject, one asking which session and one asking what for.
+#
 # Fields: attribute-key|probe
 ct_label_probes() {
   cat <<'EOF'
+session.purpose|ct_probe_session_purpose
 vcs.repository.name|ct_probe_repo_name
 vcs.ref.head.name|ct_probe_branch
 process.working_directory|ct_probe_cwd
@@ -118,9 +137,10 @@ ct_work_labels() { ct_join_labels ct_label_as_baggage; }
 #
 # The caller's own entries are passed through untouched and come first: they are
 # already in the SDK's format, and re-encoding them would turn a correct %20
-# into a literal %2520. That passthrough is the seam by which a session can be
-# labelled with things this repo cannot derive -- what the session is *for*,
-# which is what the Opus 5 vs 4.8 question needs.
+# into a literal %2520. That passthrough is the general seam for labelling a
+# session with anything this repo has no probe for; the one such fact the epic
+# actually needed -- what the session is for -- has its own probe above rather
+# than living out here, so that setting it is a variable and not a grammar.
 ct_resource_attributes() {
   local inherited="$1" merged
   merged="${inherited:+$inherited,}$(ct_work_labels)"

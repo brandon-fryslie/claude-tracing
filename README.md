@@ -96,22 +96,44 @@ can't be backfilled. `./ct claude` fills the gap, stamping onto every span of th
 
 | Attribute | Value |
 | ------------------------------ | ------------------------------------------------ |
+| `session.purpose`              | `$CT_SESSION_PURPOSE`; absent when unset         |
 | `vcs.repository.name`          | the git repository's directory name              |
 | `vcs.ref.head.name`            | the current branch; absent on a detached HEAD    |
 | `process.working_directory`    | where you launched from                          |
 
-Those are OpenTelemetry semantic conventions rather than names invented here, and they
-arrive as Jaeger *process* tags — so one tag search pulls every span of every session
-that ran in a given repo or on a given branch. Launch somewhere that isn't a git
+The last three are OpenTelemetry semantic conventions rather than names invented here,
+and they arrive as Jaeger *process* tags — so one tag search pulls every span of every
+session that ran in a given repo or on a given branch. Launch somewhere that isn't a git
 checkout and the two `vcs.*` labels are simply absent, which reads as "doesn't apply"
 rather than as a branch whose name is the empty string.
 
-Whatever you set in `OTEL_RESOURCE_ATTRIBUTES` yourself is kept and merged, so you can
-label the things this repo can't derive — like what the session is *for*:
+`session.purpose` is the one label nothing here can work out for you. Two sessions in the
+same checkout on the same branch — one writing the change, one reviewing it — look
+identical to every probe above, so you have to say:
 
 ```bash
-OTEL_RESOURCE_ATTRIBUTES=session.purpose=code-review ./ct claude
+CT_SESSION_PURPOSE=code-review ./ct claude
 ```
+
+It's a purpose and not a `review=true` flag on purpose: new categories are new *values*,
+so `CT_SESSION_PURPOSE=docs` needs no schema change and no edit to any query already
+written. And it has to be set at launch — it's a resource attribute, fixed for the life
+of the process, so a session that turns into a review halfway through can't be relabelled
+afterwards. Start a fresh one.
+
+Whatever you set in `OTEL_RESOURCE_ATTRIBUTES` yourself is kept and merged too, for
+anything else this repo has no probe for:
+
+```bash
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=staging ./ct claude
+```
+
+**If you have `OTEL_RESOURCE_ATTRIBUTES=session.purpose=…` in a shell rc, drop it** — this
+is where that used to be documented, and `CT_SESSION_PURPOSE` is now the one place the key
+is set. Setting both is not fatal: measured against Claude Code 2.1.226, a key appearing
+twice in the merged string is last-wins and the rest of the set survives, and `ct claude`
+appends what it derives after what you passed in, so `CT_SESSION_PURPOSE` wins. It's still
+two places to change one fact, and only one of them is the one the table above describes.
 
 One warning, measured rather than assumed: a single raw space anywhere in
 `OTEL_RESOURCE_ATTRIBUTES` makes Claude Code discard *every* attribute in the string,
@@ -214,6 +236,13 @@ promoted to real columns, computed once when the row is inserted:
 | `ContextTokens` | input + cache-read + cache-creation: the proxy for context size |
 | `AgentId`, `ParentAgentId`, `SubagentType`, `RequestContext` | subagents, below |
 | `Repository`, `Branch`, `WorkingDirectory` | the labels `./ct claude` stamps |
+
+`session.purpose` is the one label with no column: read it as
+`ResourceAttributes['session.purpose']`, or take it from `claude.session_turns.Purpose`,
+which is where every query below gets it. Promoting it would reach new installs only —
+`CREATE TABLE IF NOT EXISTS` is a silent no-op against a table that already exists, and
+this repo has no migration path yet (`claude-schema-729`). The bloom filters over
+`mapKeys`/`mapValues(ResourceAttributes)` serve the lookup meanwhile.
 
 `ContextTokens` is stored rather than computed per query on purpose. Claude Code emits no
 context-size attribute, so any answer about context size is a sum of three other fields —
@@ -505,6 +534,38 @@ ids spans can be joined on. Both fail silently otherwise — a renamed key reads
 string, not an error. Neither check runs when there is no `lit` workspace, no ticket history
 in it yet, or no ticket a Claude session has moved; verify says which of those it found
 rather than implying it checked.
+
+### Whether review converges faster on one model
+
+`claude.session_turns` carries `Purpose` alongside `Model`, so this is one `GROUP BY` — the
+whole reason the label exists:
+
+```bash
+./ct sql "SELECT Model, count() AS sessions, round(avg(Turns), 1) AS turns_to_converge
+          FROM (SELECT SessionId,
+                       argMax(Model, MainLoopOutputTokens) AS Model,
+                       countIf(InvokedModel)               AS Turns
+                FROM claude.session_turns
+                WHERE Purpose = 'code-review'
+                GROUP BY SessionId)
+          GROUP BY 1 ORDER BY turns_to_converge FORMAT PrettyCompact"
+```
+
+Two choices in there that decide what the number means. `countIf(InvokedModel)` counts only
+the turns that actually invoked a model, so the local slash commands and interrupted lines
+every session ends on don't inflate the count. And a session's model is `argMax(Model,
+MainLoopOutputTokens)` — because a session that switched models partway is one session, not
+two, and counting it under both would make each look faster than it was.
+
+`MainLoopOutputTokens` and not `OutputTokens`, and the difference is not pedantic: it is the
+same weight a *turn* uses to pick its own model, so the two grains answer "which model drove
+this" by one rule. Weighting by total output instead counts subagent work as main-loop work,
+and one turn that spawned a large subagent could decide the model of the entire session.
+
+**It answers with no rows today**, which is not a bug in the query and can't be fixed by
+one: `Purpose` is stamped at launch and cannot be backfilled, so the results start
+accumulating from the first `CT_SESSION_PURPOSE=code-review ./ct claude` and no earlier.
+Nothing here can tell you about a review you already ran.
 
 ## What gets recorded
 
