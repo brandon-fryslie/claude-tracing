@@ -650,6 +650,17 @@ startup_scripts:
             -- than milliseconds. ClickHouse's default patience is 10s and a
             -- backlog only grows, so the wait is stated rather than left to a
             -- default that a larger backlog would silently start tripping.
+            --
+            -- 60000ms is CT_LIT_TIMEOUT_SECONDS in lib/common.sh, in the other
+            -- unit, and the two have to move together. ClickHouse substitutes
+            -- whole values and never substrings of a query, so @from_env cannot
+            -- reach inside this SQL string and a comment is the only join
+            -- available -- the same duplication lit_export.sh's filename
+            -- carries, documented the same way. Raise this without raising that
+            -- one and `ct` hangs up on a query ClickHouse is still lawfully
+            -- working on, then blames the timeout on causes it is not; lower it
+            -- without lowering that one and the probe outlives the query it is
+            -- meant to predict. [LAW:one-source-of-truth]
             SETTINGS command_read_timeout = 60000
           )
         )
@@ -850,7 +861,12 @@ startup_scripts:
         SELECT
           life.Ticket       AS Ticket,
           life.Started      AS Started,
-          life.Closed       AS Closed,
+          -- NULL rather than the DateTime64 zero a never-closed ticket's maxIf
+          -- returns. 1970-01-01 is answer-shaped: it reads as a close date, and
+          -- a query that forgets `WHERE Completed` gets one instead of nothing.
+          -- The raw value is still what WorkedUntil consumes below -- one place
+          -- computes it, this decides how it is shown. [LAW:parse-dont-validate]
+          if(life.Completed, life.Closed, NULL) AS Closed,
           life.Completed    AS Completed,
           turn.SessionId    AS SessionId,
           turn.Turn         AS Turn,
@@ -896,17 +912,26 @@ startup_scripts:
           -- to be open at the time. ToStatus is empty for exactly those
           -- annotating events, and Moves is filtered on it above.
           --
-          -- SwitchedAway is the moment this session moved on: its next
-          -- transition on a DIFFERENT ticket after it engaged with this one.
-          -- The exclusion is the load-bearing half. Read as "its next
-          -- transition of any kind", a session that closes this ticket, reopens
-          -- it and closes it again caps itself at its own first close, while
-          -- WorkedUntil correctly runs to the last one -- so `least` below picks
-          -- the stale close and every turn worked across the reopen disappears.
-          -- That is the exact silent drop the Completed/argMax reading above
-          -- exists to prevent, and it would have been reintroduced here, one
-          -- join further down. Moving a ticket you are already on is not moving
-          -- on from it. [LAW:no-silent-failure]
+          -- SwitchedAway is the moment this session moved on, and the whole of
+          -- it rests on EngagedUntil being the session's LAST move on this
+          -- ticket rather than its first. Anchored on the first, "its next move
+          -- elsewhere" means its next move after it ARRIVED, when what is
+          -- wanted is its next move after it LEFT -- so a session that claims
+          -- this ticket, steps away to another, then comes back and finishes it
+          -- caps at the excursion and loses everything after the return, while
+          -- WorkedUntil correctly runs to the close. Same shape for a reopen:
+          -- the session's own second visit falls past its own first departure.
+          -- Both are the silent drop the Completed/argMax reading above exists
+          -- to prevent, and both are answered by which end of the engagement
+          -- the anchor sits on. [LAW:no-silent-failure]
+          --
+          -- Anchoring on the last move is also why nothing here has to exclude
+          -- moves on this same ticket: every one of them is at or before the
+          -- session's last move on it, so `later.3 > EngagedUntil` has already
+          -- dropped them. An explicit `later.1 != Ticket` was tried and removed
+          -- as dead weight -- it re-states in a filter what the anchor already
+          -- guarantees, and a second enforcer of an invariant is a second thing
+          -- that can come to disagree with it. [LAW:single-enforcer]
           --
           -- Without the cap at all, one ticket left in_progress and forgotten
           -- has a window running to now() forever, quietly collecting that
@@ -921,6 +946,15 @@ startup_scripts:
           -- real work precedes it. The ticket's own window stays the primary
           -- bound; this is a cap laid on top of it.
           --
+          -- The price of that, stated because it runs the OTHER way from every
+          -- caveat below: the floor is life.Started, shared by all participants,
+          -- so a session that only engages this ticket late -- one reopen near
+          -- the end, say -- contributes its turns from the ticket's own
+          -- beginning, including turns it spent on work that had nothing to do
+          -- with this ticket. That overcounts. Every other known failure here
+          -- undercounts or reports absence, so this is the one number that can
+          -- be confidently too big rather than conservatively too small.
+          --
           -- The sentinel is an identity, not a special case: a session that
           -- never moved again contributes +infinity, so `least` below decides
           -- the bound with no branch to read.
@@ -932,11 +966,10 @@ startup_scripts:
               [toDateTime64('2262-01-01 00:00:00', 9, 'UTC')],
               arrayMap(later -> later.3,
                        arrayFilter(later -> later.2 = SessionId
-                                            AND later.1 != Ticket
-                                            AND later.3 > EngagedFrom,
+                                            AND later.3 > EngagedUntil,
                                    Moves)))) AS SwitchedAway
           FROM (
-            SELECT move.1 AS Ticket, move.2 AS SessionId, min(move.3) AS EngagedFrom
+            SELECT move.1 AS Ticket, move.2 AS SessionId, max(move.3) AS EngagedUntil
             FROM (SELECT arrayJoin(Moves) AS move)
             WHERE move.2 != ''
             GROUP BY Ticket, SessionId
