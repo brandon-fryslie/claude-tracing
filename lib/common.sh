@@ -36,10 +36,20 @@ CT_CLICKHOUSE_NATIVE_PORT=9000  # clickhouse <- collector (native protocol)
 # collector is this stack talking about itself, and collector.yaml's filter
 # drops it.
 #
-# A third subject costs one constant here and one clause in the anchored OTTL
-# condition there -- one clause and not three, because that condition is written
-# once and aliased into the metrics and logs pipelines. Adding a subject to
-# traces alone is not a mistake this pair can make.
+# A third subject costs three edits, and they are worth knowing before you make
+# the first: a constant here, one clause in the anchored OTTL condition in
+# config/collector.yaml, and the `mine` list in ct's ct_foreign_row_query.
+#
+# One OTTL clause and not three, because that condition is written once and
+# aliased into the metrics and logs pipelines -- adding a subject to traces
+# alone is not a mistake this pair can make. But `mine` is a separate statement
+# of the same membership, in SQL rather than OTTL, and it has to be: the filter
+# needs the names as clauses, the count needs them as a list. What holds the
+# three together is that every way of getting them out of step fails loudly.
+# Narrow the filter and stage 2 dies with a sink that never received the
+# selftest run. Widen it past `mine` and stage 4 dies calling the new subject's
+# own healthy telemetry foreign. There is no combination that goes quiet, which
+# is the property to preserve if a fourth place ever needs the set.
 #
 # Naming them here rather than in `ct` is what makes that filter possible at
 # all -- config/*.yaml can only read this file, via ${env:...}, so an allowlist

@@ -55,7 +55,27 @@ ct_clickhouse_url() { printf 'http://127.0.0.1:%s/' "$CT_CLICKHOUSE_HTTP_PORT"; 
 # the OTel form, so clickhouse.yaml's four variables were never checked while
 # the comment claimed every config was.
 ct_config_env_refs() {
-  grep -oE '\$\{env:[A-Za-z_][A-Za-z0-9_]*\}|"@from_env": *[A-Za-z_][A-Za-z0-9_]*' "$1" \
+  local refs status=0
+
+  refs="$(grep -oE '\$\{env:[A-Za-z_][A-Za-z0-9_]*\}|"@from_env": *[A-Za-z_][A-Za-z0-9_]*' "$1")" \
+    || status=$?
+
+  # grep answers 1 for "nothing matched" and 2 for "I could not read that",
+  # opposite meanings wearing the same non-zero. A config that reads no
+  # environment at all is a legitimate config with nothing to check; one that
+  # cannot be read is a fault, and only the second is an error to report.
+  # [LAW:parse-dont-validate] the two are separated here, once, rather than
+  # left for each caller to guess at.
+  #
+  # Separating them is also what makes this function safe to call either way.
+  # Returning non-zero for the empty case is invisible through the process
+  # substitution ct_assert_config_env uses and fatal-with-no-message through a
+  # `x="$(...)"` assignment under set -e -- a function whose success depends on
+  # the caller's syntax is a seam, not a boundary.
+  [ "$status" -le 1 ] || ct_die "could not read $1 to find the environment it needs"
+  [ -n "$refs" ] || return 0
+
+  printf '%s\n' "$refs" \
     | sed -E 's/^\$\{env:(.*)\}$/\1/; s/^"@from_env": *//' \
     | sort -u
 }
@@ -652,6 +672,7 @@ ct_env_reference_cases() {
         endpoint: 127.0.0.1:${env:CT_OTLP_GRPC_PORT}|CT_OTLP_GRPC_PORT
   "@from_env": CT_CLICKHOUSE_HTTP_PORT|CT_CLICKHOUSE_HTTP_PORT
         - resource.attributes["x"] != "${env:CT_CLAUDE_SERVICE_NAME}"|CT_CLAUDE_SERVICE_NAME
+  timeout: 2s|
 EOF
 }
 
@@ -727,11 +748,20 @@ verify_config_env_guard() {
 
   # Declared here rather than in the table because how a variable comes to exist
   # is the thing under test, and bash has no way to say it as data.
-  export CT_PROBE_PLAIN=value
-  CT_PROBE_UNEXPORTED=value
-  declare -rx CT_PROBE_READONLY=value
-  declare -ix CT_PROBE_INT=7
-  export CT_PROBE_EMPTY=
+  #
+  # [LAW:effects-at-boundaries] `local` on every one of them, including the
+  # exported ones. A bare `export` inside a function is not scoped to it -- it
+  # becomes a global of the ct process and rides out into every child launched
+  # afterwards, which here would mean the real `claude` session stage 3 spawns:
+  # a test fixture reaching the subject this stack then traces. `local -x` is
+  # both at once -- function-scoped and visible to children, so it is still
+  # exactly what ct_var_reaches_children has to be able to see, and it is gone
+  # when this returns.
+  local -x CT_PROBE_PLAIN=value
+  local CT_PROBE_UNEXPORTED=value
+  local -rx CT_PROBE_READONLY=value
+  local -ix CT_PROBE_INT=7
+  local -x CT_PROBE_EMPTY=
 
   while IFS='|' read -r how reaches; do
     case "$how" in
@@ -1329,8 +1359,14 @@ verify_claude() {
 # start of the second it was taken in, and a foreign row already written earlier
 # in that same second would be counted against this run -- a false failure in
 # exactly the case the time scoping exists to exclude.
+#
+# Its own function for the same reason ct_foreign_row_query is: the call that
+# DECIDES and the call that explains a failure must send the same bytes, or the
+# explanation answers about a query that never ran.
+ct_clickhouse_now_query() { printf '%s' "SELECT now64(9) FORMAT TSV"; }
+
 ct_clickhouse_now() {
-  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "SELECT now64(9) FORMAT TSV"
+  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_clickhouse_now_query)"
 }
 
 # Rows written since $1 whose ServiceName is not one of this stack's subjects --
@@ -1437,7 +1473,7 @@ cmd_verify() {
   run_start="$(ct_clickhouse_now)" \
     || ct_die "ClickHouse would not answer for the time -- is the stack up?
     ./ct status
-  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" 'SELECT now64(9) FORMAT TSV')"
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_clickhouse_now_query)")"
 
   verify_transport
   verify_claude
