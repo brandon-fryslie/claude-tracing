@@ -25,8 +25,8 @@ no git branch, no ticket, no notion of what the session was for.
 | --- | --- | --- |
 | Tokens on tool usage in March | **Answered** — `claude.llm_requests`, below | — |
 | Where tokens go past 400k context | Yes | — |
-| Avg turns to complete a ticket | **Answered** — `claude.ticket_turns`, below | — (but no Sonnet 5 turns are recorded) |
-| Opus 5 vs 4.8 review convergence | **Not yet** | what marks a session as a review |
+| Avg turns to complete a ticket | **Answered** — `claude.ticket_turns`, below | — (but 0 of the 8 turns attributed to a ticket are Sonnet 5) |
+| Opus 5 vs 4.8 review convergence | **Recording, not yet answerable** — needs review sessions launched from here on | — (nothing before 2026-08-26 can be classified) |
 
 That gap sets the priority for everything else. Storage can be migrated; an attribute
 that was never emitted is gone. **What gets recorded is perishable. Where it's stored is
@@ -48,8 +48,26 @@ of whoever moved a ticket, so the join key existed before the question was asked
 did not hold here: the ticket was ranked last *of the recording work* on the theory that it
 could be built retroactively, and that theory turned out to be exactly right.
 
-What remains is the review question: nothing derives automatically what marks a session as
-a review, and that rides in on the launcher's passthrough.
+The review question closed the way the paragraph above predicted, and is worth reading
+beside the ticket correction because the two came out opposite. As of 2026-08-26,
+`CT_SESSION_PURPOSE=code-review ./ct claude` stamps `session.purpose` on every span of the
+session and `claude.session_turns.Purpose` carries it, so the comparison is the one `GROUP
+BY` the README shows.
+
+**The query returns no rows, and that is the honest answer, not a defect.** It was run on
+2026-08-26 against every session in the store — 44 of them, 54 turns — and not one is a
+review session, of either model, because the label did not exist until that day. The
+`(unlabelled)` split is in Re-measuring, and that is the number to re-run rather than
+trust: it only ever grows.
+
+This is the clean case of the perishability argument. Unlike the ticket join, there is no
+`lit`-shaped record hiding a key that was already being written, and no amount of later
+work recovers a single review session run before the label landed. The count starts
+accumulating from the next `CT_SESSION_PURPOSE=code-review` launch and no earlier.
+
+It is a purpose rather than a `review=true` flag so that the next category — docs, spike,
+incident — is a new value rather than a new attribute, a new column, and an edit to every
+query that groups by category.
 
 ## Volume, measured
 
@@ -376,7 +394,10 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | `interaction.sequence` appears only on `interaction` spans | **Measured** — 0 of 2,199 non-interaction spans carry the key |
 | 7 of 38 turns invoked no model | **Measured** — counted from `claude.session_turns` |
 | Turns per completed ticket: 1, 1, 1, 5 | **Measured** — n=4 tickets, all `claude-opus-5[1m]`, small sample |
-| Average turns to complete a ticket with Sonnet 5 | **Unanswerable** — no Sonnet 5 turns recorded |
+| Average turns to complete a ticket with Sonnet 5 | **Unanswerable** — Sonnet 5 turns exist (`ct verify` probe sessions), but 0 of the 8 turns attributed to a ticket are Sonnet 5 |
+| Per-MTok rates for `claude-sonnet-5`: 3 / 0.3 / 6 / 15 | **Measured** — 2026-08-26; two independent series reconciled to their cost counters exactly, residuals 0 and 3e-17 |
+| Review convergence, Opus 5 vs 4.8 | **Unanswerable** — 0 of 44 sessions carry `session.purpose = 'code-review'`; the label landed 2026-08-26 and nothing before it can be classified. Re-run below |
+| A key repeated in `OTEL_RESOURCE_ATTRIBUTES` is last-wins | **Measured** — 2.1.226; one run with `session.purpose` set both by hand and by the probe landed the probe's value, and the rest of the set survived intact |
 | Events pipeline volume vs its 256 MB ceiling | **Measured** — 4,798 records over 82.2h; the ceiling held ~2 weeks, which moved events into ClickHouse. Full derivation in the `claude.events` comment in `config/clickhouse.yaml` |
 | `agent_id` on llm_request, `subagent_type` on the Agent tool span | **Measured** — traced session spawning a subagent, 2026-08-23 |
 | `parent_agent_id` exists at all | **Unmeasured** — never seen in this stack's data; the column is empty |
@@ -489,6 +510,20 @@ Once there is a real month in ClickHouse, this settles the 150–400 MB/year est
           GROUP BY partition ORDER BY partition FORMAT PrettyCompact"
 ```
 
+How many review sessions there are to compare yet, and how the pool splits. The Confidence
+row above says zero of both models as of 2026-08-26; this is the count that supersedes it,
+and it only ever grows from `CT_SESSION_PURPOSE=code-review` launches made after that date:
+
+```bash
+./ct sql "SELECT purpose, model, count() AS sessions
+          FROM (SELECT SessionId,
+                       if(any(Purpose) = '', '(unlabelled)', any(Purpose)) AS purpose,
+                       argMax(Model, MainLoopOutputTokens)                 AS model
+                FROM claude.session_turns
+                GROUP BY SessionId)
+          GROUP BY purpose, model ORDER BY sessions DESC FORMAT PrettyCompact"
+```
+
 Per-token rates, reconciled against Claude Code's own cost counter. This is the one
 measurement here that decides billed dollars, so it is the one most worth re-running
 rather than trusting — after a suspected price change, or when `ct verify` reports an
@@ -509,6 +544,7 @@ RATE = {
  'claude-opus-5[1m]':         dict(input='5.0', cacheRead='0.5', cacheCreation='10.0', output='25.0'),
  'claude-opus-5':             dict(input='5.0', cacheRead='0.5', cacheCreation='10.0', output='25.0'),
  'claude-haiku-4-5-20251001': dict(input='1.0', cacheRead='0.1', cacheCreation='2.0',  output='5.0'),
+ 'claude-sonnet-5':            dict(input='3.0', cacheRead='0.3', cacheCreation='6.0',  output='15.0'),
 }
 cost, toks = {}, collections.defaultdict(dict)
 for line in open('/tmp/ct-metrics.txt'):
