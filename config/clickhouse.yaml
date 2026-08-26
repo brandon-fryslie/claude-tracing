@@ -682,8 +682,12 @@ startup_scripts:
     #
     # NEVER JOIN THESE BY TRACE ID. A `claude` launched from inside another
     # session's Bash tool call parents its root span to the caller's, so one
-    # trace here holds three distinct sessions, and `ct verify` creates that
-    # shape on every run. SessionId is the key; TraceId is not.
+    # trace here holds more than one session -- traces of five are on file, and
+    # the nesting goes as deep as the sessions do. `ct verify` adds a session to
+    # whatever trace is already open around it, which makes this shape routine
+    # whenever verify is run from inside a Claude Code session, as it is during
+    # this repo's own development; run from a plain shell it is one session like
+    # any other. SessionId is the key; TraceId is not.
     #
     # The turn definition is a CTE because it is needed twice -- once as the list
     # of turns, once to place each request in one -- and a definition spelled out
@@ -893,9 +897,20 @@ startup_scripts:
           -- annotating events, and Moves is filtered on it above.
           --
           -- SwitchedAway is the moment this session moved on: its next
-          -- transition of any kind after it engaged with this ticket. Without
-          -- it, one ticket left in_progress and forgotten has a window running
-          -- to now() forever and quietly collects that session's entire
+          -- transition on a DIFFERENT ticket after it engaged with this one.
+          -- The exclusion is the load-bearing half. Read as "its next
+          -- transition of any kind", a session that closes this ticket, reopens
+          -- it and closes it again caps itself at its own first close, while
+          -- WorkedUntil correctly runs to the last one -- so `least` below picks
+          -- the stale close and every turn worked across the reopen disappears.
+          -- That is the exact silent drop the Completed/argMax reading above
+          -- exists to prevent, and it would have been reintroduced here, one
+          -- join further down. Moving a ticket you are already on is not moving
+          -- on from it. [LAW:no-silent-failure]
+          --
+          -- Without the cap at all, one ticket left in_progress and forgotten
+          -- has a window running to now() forever, quietly collecting that
+          -- session's entire
           -- subsequent history -- months of unrelated turns and cost filed under
           -- a ticket nobody ever finished. That needs only ONE stale ticket,
           -- where the shared-turn caveat above needs two live ones.
@@ -917,6 +932,7 @@ startup_scripts:
               [toDateTime64('2262-01-01 00:00:00', 9, 'UTC')],
               arrayMap(later -> later.3,
                        arrayFilter(later -> later.2 = SessionId
+                                            AND later.1 != Ticket
                                             AND later.3 > EngagedFrom,
                                    Moves)))) AS SwitchedAway
           FROM (
