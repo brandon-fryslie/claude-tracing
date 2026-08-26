@@ -37,6 +37,19 @@ launched with, a ClickHouse row whose promoted columns are populated rather than
 present, the tokens that session spent being attributable to the tool call it made, and
 every one of its requests carrying a price so the session has a cost in dollars.
 
+One last check runs only if it applies: where a [`lit`](#how-many-turns-a-ticket-took-and-what-it-cost)
+workspace answers, verify confirms its history still parses and its actors are still
+session ids spans can be joined on. With no `lit`, no tickets in it, or no ticket a Claude
+session has moved — including a checkout nobody ran `lit init` in — it says so and carries
+on: the telemetry path does not depend on an issue tracker this stack doesn't install.
+
+Two kinds of lit trouble do fail the run, and they split on whether lit produced an export
+at all. A workspace that *has* a store and still can't be exported from is one, because
+that is something that used to work and stopped. The other is everything downstream of a
+*successful* export — ClickHouse unable to run `lit` itself, a bridge script left pointing
+at the old workspace, an export whose shape or actor format has drifted out from under the
+views. Those are loud by design; the message for each names what to go look at.
+
 Each stage picks a session id before it emits anything and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still
 lying around. Nothing the stack writes sits outside that check: break any one exporter
@@ -182,7 +195,8 @@ promoted to real columns, computed once when the row is inserted:
 | Column | From |
 | ---------------------------------------------------------- | ----------------------------------- |
 | `SpanType` | `interaction`, `llm_request`, `tool`, `tool.execution`, `tool.blocked_on_user` |
-| `SessionId`, `InteractionSequence` | which session, and which turn within it |
+| `SessionId` | which session — the key to group by; see the trace-id warning below |
+| `InteractionSequence` | which turn within it, and **only on `interaction` spans**: every other span type reads 0, so a request finds its turn by timestamp, not by this |
 | `Model`, `ToolName`, `StopReason` | the obvious grouping keys |
 | `InputTokens`, `OutputTokens`, `CacheReadTokens`, `CacheCreationTokens` | as emitted |
 | `ContextTokens` | input + cache-read + cache-creation: the proxy for context size |
@@ -352,6 +366,133 @@ rather than a new definition. The definition itself lives in `config/clickhouse.
 quietly. A renamed `stop_reason` would take out two of the three clauses; the third reads a
 different attribute entirely and would go on marking every subagent request, so the number
 comes back a large, plausible undercount rather than an obvious zero.
+
+### How many turns a ticket took, and what it cost
+
+```bash
+./ct sql "SELECT Ticket,
+                 count()                 AS turns,
+                 uniqExact(SessionId)    AS sessions,
+                 argMax(Model, TotalTokens) AS model,
+                 round(sum(CostUSD), 2)  AS usd
+          FROM claude.ticket_turns
+          WHERE Completed
+          GROUP BY Ticket ORDER BY min(Started) FORMAT PrettyCompact"
+```
+
+**`lit` is a prerequisite this stack does not install.** It has to be on the `PATH` of the
+ClickHouse process, and its store lives in `.git/links` — so a fresh clone has no backlog
+until you `lit init`. The join answers for exactly one workspace, named by
+`CT_LIT_WORKSPACE` (default: this checkout); point it elsewhere and re-run `./ct up` to
+regenerate the bridge script — repointing the variable alone moves only what `./ct verify`
+probes, not what the query reads. Without `lit`, everything else on this page works unchanged
+and `./ct verify` reports the ticket join as not checked rather than failing. A `lit` that is
+installed and *fails* is the other case and does fail the run: a backlog that answered
+yesterday and errors today is a regression, not an absence, and the two are reported
+separately rather than both as "not checked".
+
+This is the one question that reaches outside the span store, because it needs a fact no
+span can carry: whether the ticket was *finished*. A span is stamped when a session starts
+and never changes, so nothing in it could know about a close that happens hours later in a
+different session. That fact lives in `lit`, this repo's issue tracker.
+
+The join needs no correlation and no guesswork, because both sides already share a key.
+`lit` records the actor of every transition as `claude_<session id>` — literally the id
+Claude Code stamps on its own telemetry. So `claude.ticket_events` runs `lit export` at
+query time and lines its actors up against `SessionId`. Nothing stamps a ticket onto a
+span, and nothing should: it would be a second answer to a question `lit` already answers
+exactly, written at the one moment the answer is least known.
+
+**Turns here are long.** One turn ran 3 hours 35 minutes and did the whole of `zbi.4` —
+116 requests, 19.9M tokens, one prompt. A "turn" is one thing you asked for, not one
+message, so counts are small and the averages read low.
+
+That length is also what makes the obvious query wrong. `zbi.4`'s turn began *two minutes
+before* the `lit start` that claimed the ticket and ran hours past it, so a turn is
+attributed when its interval **overlaps** the ticket's window — not when its start
+timestamp falls inside it. Point containment scores that ticket zero turns, tidily and
+incorrectly.
+
+The full definition, since the number is meaningless without it:
+
+- A ticket's window runs from its first move into `in_progress` to its last into `closed`,
+  or **to now if it hasn't closed** — an open ticket has been worked up to the present
+  moment, so it has a window and turns like any other. `Completed` is what separates the
+  two, and it reads the ticket's *latest* status rather than whether a close ever happened:
+  a ticket that was closed and reopened is open again, and the turns worked since the
+  reopen are counted. A ticket is often not one session — `zbi.5` was started by one and
+  closed by another two days later — so the window, not the session, is the unit.
+- Its sessions are the ones `lit` records *moving* it — claiming, closing, reopening — not
+  every session that touched it. A grooming pass that re-ranks thirty tickets in one sitting
+  would otherwise become a participant in all thirty and donate its turns to whichever
+  windows were open. That is a floor, not a census: a session that worked a ticket and never
+  transitioned it leaves no trace and cannot be counted.
+- Each session's contribution is capped at the moment it **moved on** — its next transition
+  after its own *last* move on this ticket. So the window above is the ticket's bound, and
+  this is a second one laid on top of it per session: a session that claimed a ticket,
+  wandered off to another and never came back stops contributing when it left, not at `now()`.
+  Anchoring on the last move rather than the first is what lets a session leave and *return* —
+  it is the departure that ends the engagement, not the arrival — so reopening a ticket, or
+  stepping away and coming back to finish it, counts the whole of the work rather than
+  stopping at the first excursion. A session that never moved anything else is capped by the
+  ticket's window alone.
+- Turns that invoked no model don't count. Every session on file ends with one or more
+  sub-second turns — a slash command handled locally, an interrupted line — and counting
+  them would inflate every ticket by one or two. They stay visible in
+  `claude.session_turns`, marked `InvokedModel = false`, rather than being quietly dropped.
+- `Completed` is carried so averages can exclude open tickets. Averaging over a ticket
+  still being worked measures how far it has got, not what it took.
+
+Ways this can still be wrong, none of them fixable from here, worst first:
+
+- A session that claims a ticket, never closes it, and **never touches another ticket** keeps
+  accruing to it. The cap above needs somewhere to have moved on *to*; when there is nowhere,
+  the window runs to `now()` and quietly collects that session's entire subsequent history.
+  This is the worst of the three because it needs only one forgotten ticket.
+- Two tickets open at once share their overlapping turns, because nothing records which one a
+  turn was actually for.
+- A session that worked a ticket without ever transitioning it is invisible, per the second
+  bullet above — its turns land on whatever else it did move, or nowhere.
+- The one that runs the *other* way, and so is the easiest to misread: the floor is the
+  ticket's own start, shared by every session, not each session's own arrival. A session
+  that engages a ticket only late — a single reopen near the end — contributes turns from
+  the ticket's beginning, including turns spent on unrelated work. That **overcounts**,
+  where the three above undercount. The floor is deliberate: `zbi.5`'s closing session has
+  exactly one event on the ticket, the `done` at the very end, so a per-session floor would
+  discard everything it actually did.
+
+Not on that list, because it is the intended behaviour rather than a defect: a ticket whose
+sessions predate the recording has no turns at all, and is absent from the results rather
+than reported as zero. Zero turns is an answer; this is the absence of one.
+
+**Group by `SessionId`, never `TraceId`.** A `claude` launched from inside another
+session's Bash tool call parents its root span to the caller's, so one trace in this store
+holds more than one session — traces of five are on file. Running `ct verify` from inside a
+Claude Code session, as this repo's own development does, produces that shape; run from a
+plain shell it is one session like any other.
+
+`claude.session_turns` sits underneath, one row per turn with its model, tokens and cost
+and no ticket attached, so "where did this *turn* go" is answerable on its own. It is not a
+session total: a request belonging to no turn — `RequestContext = 'standalone'`, title
+generation and the like — falls inside no window and so appears in no row, which on the
+store this was written against is $0.25 of an $88.27 total. `claude.llm_requests` is the
+authority for what a session cost; this view is the authority for what a turn cost.
+
+A turn's `Model` is the model that produced the most main-loop output in it, not the model
+of any one request: turns run subagents on other models and pick up background Haiku calls,
+so the question is about the weight of the work.
+
+If `lit` can't be read, `claude.ticket_events` and `claude.ticket_turns` raise an error
+rather than returning no rows. Only those two — `claude.session_turns` reads `claude.spans`
+and `claude.llm_requests` and never touches `lit`, so it keeps answering normally while the
+ticket views are failing. That distinction is the whole point — "you have no tickets" and "I couldn't reach the tracker"
+must not arrive as the same answer, or an average over nothing looks like a real number.
+When the ticket join is checked at all, `ct verify` re-checks both halves: that `lit`'s
+export still parses into the fields these views read, and that its actors are still session
+ids spans can be joined on. Both fail silently otherwise — a renamed key reads as an empty
+string, not an error. Neither check runs when there is no `lit` workspace, no ticket history
+in it yet, or no ticket a Claude session has moved; verify says which of those it found
+rather than implying it checked.
 
 ## What gets recorded
 

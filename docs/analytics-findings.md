@@ -25,22 +25,31 @@ no git branch, no ticket, no notion of what the session was for.
 | --- | --- | --- |
 | Tokens on tool usage in March | **Answered** — `claude.llm_requests`, below | — |
 | Where tokens go past 400k context | Yes | — |
-| Avg turns to complete a ticket | **Not yet** | which ticket, and whether it completed |
+| Avg turns to complete a ticket | **Answered** — `claude.ticket_turns`, below | — (but no Sonnet 5 turns are recorded) |
 | Opus 5 vs 4.8 review convergence | **Not yet** | what marks a session as a review |
 
 That gap sets the priority for everything else. Storage can be migrated; an attribute
 that was never emitted is gone. **What gets recorded is perishable. Where it's stored is
-not.** Every day without work-unit labels is another day that can never answer questions
-3 and 4, retroactively, forever — which is why the labelling ticket outranks the more
-interesting ClickHouse ticket.
+not.** Every day without work-unit labels is another day that can never answer question 4,
+retroactively, forever — which is why the labelling ticket outranks the more interesting
+ClickHouse ticket. Question 3 was on this list too, and turned out not to belong on it; the
+correction is two paragraphs down, and it is the more interesting half of the story.
 
 The fix was cheap, and as of 2026-08-23 it is in: `./ct claude` stamps
 `vcs.repository.name`, `vcs.ref.head.name`, and `process.working_directory` onto every
 span of the session through `OTEL_RESOURCE_ATTRIBUTES`, and they are searchable as Jaeger
 process tags. That closes the "which repo, which branch" half of the gap for every
-session launched that way. Both remaining columns above need one more join each — the
-ticket and its completion (ticket 6), and whatever marks a session as a review, which
-nothing derives automatically and which rides in on the launcher's passthrough.
+session launched that way.
+
+The ticket half closed differently than expected, and worth recording as a correction to
+the paragraph above: it needed nothing recorded at all. `lit` already stores the session id
+of whoever moved a ticket, so the join key existed before the question was asked — see
+"Turns per ticket" below. The perishability argument still holds for everything else, but it
+did not hold here: the ticket was ranked last *of the recording work* on the theory that it
+could be built retroactively, and that theory turned out to be exactly right.
+
+What remains is the review question: nothing derives automatically what marks a session as
+a review, and that rides in on the launcher's passthrough.
 
 ## Volume, measured
 
@@ -299,6 +308,53 @@ requests cost exactly nothing. Nothing errors and no row goes missing. Removing
 `claude-opus-5[1m]` from the rate table took one session from $13.44 to $0.0015 — a
 99.99% undercount that still reads like a number someone might believe.
 
+### Turns per ticket: the join key was already there
+
+The question — *average turns to complete a ticket* — looked like it needed a new attribute
+stamped on every span, and it did not. `lit` records the actor of every state transition as
+`claude_<session id>`, and that id is the same one Claude Code stamps on its telemetry. The
+two stores already shared a key; nothing had to be recorded to make the join possible, only
+noticed. That inverts the epic's usual perishability argument: this was the one piece that
+could be built retroactively, and it was.
+
+What the store holds. Five tickets are completed; these are the four that have telemetry:
+
+| Ticket | Turns | Sessions | Model | Cost |
+| --- | --- | --- | --- | --- |
+| `zbi.2` | 1 | 1 | `claude-opus-5[1m]` | $5.69 |
+| `zbi.3` | 1 | 1 | `claude-opus-5[1m]` | $6.50 |
+| `zbi.4` | 1 | 1 | `claude-opus-5[1m]` | $16.12 |
+| `zbi.5` | 5 | 2 | `claude-opus-5[1m]` | $52.24 |
+
+**The epic asks this question about Sonnet 5, and the answer is that there is no Sonnet 5
+data.** Every recorded turn ran on `claude-opus-5[1m]`. The machinery answers the question;
+the sample does not contain the model it asks about. `zbi.1` is absent entirely — it closed
+before recording started, so it has no turns rather than zero turns.
+
+Three things measured on the way, each of which would have made the number wrong:
+
+**Turns are long, and the average is small.** One turn ran 3h35m and completed `zbi.4` on
+its own: 116 requests, 19.9M tokens. A turn is one thing you asked for, not one message.
+`zbi.5`'s five turns are five prompts across two sessions and two days.
+
+**Turn intervals overlap ticket windows; they don't sit inside them.** `zbi.4`'s single turn
+began two minutes *before* the `lit start` that claimed the ticket and ran hours past its
+close. Attributing on the start timestamp alone scores that ticket zero turns — a wrong
+answer that looks like a clean one.
+
+**Every session ends with turns that invoked no model.** 7 of 38 interaction spans on file
+made zero LLM requests: sub-second turns, a slash command handled locally or an interrupted
+line. Counting them inflates every ticket by one or two, and on a 1-turn ticket that is a
+100% error. They are excluded by a named `InvokedModel` flag rather than by a join quietly
+failing to match them, which is how the first version of the query got the right answer for
+the wrong reason.
+
+One trap worth restating because it survives into any future query here: **a trace id is not
+a session key.** A `claude` launched from inside another session's Bash tool call parents its
+root span to the caller's, so one trace in this store holds more than one session id — traces
+of five are on file. Running `ct verify` from inside a Claude Code session, as this repo's own
+development does, produces that shape; run from a plain shell it is one session like any other.
+
 ## Confidence: measured, derived, assumed
 
 The first volume estimate in this investigation was wrong by 5× because a usage rate was
@@ -313,6 +369,11 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | ClickHouse compression 20–50× → 150–400 MB/year | **Assumed** — reasoned from the 60% redundancy, not benchmarked |
 | Claude Code honors `OTEL_RESOURCE_ATTRIBUTES` | **Measured** — 2.1.226; attributes land as Jaeger process tags and answer a tag search |
 | One raw space discards the whole attribute set | **Measured** — controlled pair, one variable changed; see below |
+| `lit` actors are `claude_<session id>`, joinable to spans | **Measured** — every agent-authored event on file; `ct verify` re-checks it |
+| `interaction.sequence` appears only on `interaction` spans | **Measured** — 0 of 2,199 non-interaction spans carry the key |
+| 7 of 38 turns invoked no model | **Measured** — counted from `claude.session_turns` |
+| Turns per completed ticket: 1, 1, 1, 5 | **Measured** — n=4 tickets, all `claude-opus-5[1m]`, small sample |
+| Average turns to complete a ticket with Sonnet 5 | **Unanswerable** — no Sonnet 5 turns recorded |
 | Events pipeline volume vs its 256 MB ceiling | **Unmeasured** — nobody has counted; ticket 7 measures first |
 | `agent_id` on llm_request, `subagent_type` on the Agent tool span | **Measured** — traced session spawning a subagent, 2026-08-23 |
 | `parent_agent_id` exists at all | **Unmeasured** — never seen in this stack's data; the column is empty |
