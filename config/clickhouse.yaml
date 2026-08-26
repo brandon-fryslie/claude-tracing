@@ -847,11 +847,20 @@ startup_scripts:
     # over a ticket still being worked measures how far it has got, not what it
     # took. [LAW:dataflow-not-control-flow]
     #
-    # WHAT IS STILL NOT SEPARABLE, stated rather than left to be discovered: two
-    # tickets genuinely worked in the same turn share it, because nothing records
-    # which of them the turn was for. And a session that claims a ticket, never
-    # closes it, and never touches another ticket keeps accruing to it -- neither
-    # store holds anything that could bound that case.
+    # WHAT IS STILL NOT SEPARABLE, stated rather than left to be discovered,
+    # worst first. A session that claims a ticket, never closes it, and never
+    # touches another ticket keeps accruing to it -- neither store holds
+    # anything that could bound that case, and it needs only ONE stale ticket.
+    # Two tickets genuinely worked in the same turn share it, because nothing
+    # records which of them the turn was for. A session that worked a ticket and
+    # never transitioned it leaves no trace and cannot be counted at all.
+    #
+    # And one that runs the OTHER way, kept last because it is the one a reader
+    # will not be expecting: the participant floor is Started, shared by every
+    # session, so a session that engages late contributes turns from before it
+    # arrived. That overcounts, where the three above undercount or report
+    # absence. Argued where it is implemented, at the participant join below.
+    # This list and the README's must agree; they are the same list.
     - query: |
         CREATE OR REPLACE VIEW claude.ticket_turns AS
         WITH

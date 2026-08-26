@@ -41,9 +41,14 @@ One last check runs only if it applies: where a [`lit`](#how-many-turns-a-ticket
 workspace answers, verify confirms its history still parses and its actors are still
 session ids spans can be joined on. With no `lit`, no tickets in it, or no ticket a Claude
 session has moved — including a checkout nobody ran `lit init` in — it says so and carries
-on: the telemetry path does not depend on an issue tracker this stack doesn't install. The
-one lit problem that does fail the run is a workspace that *has* a store and still can't be
-exported, because that is something that used to work and stopped.
+on: the telemetry path does not depend on an issue tracker this stack doesn't install.
+
+Two kinds of lit trouble do fail the run, and they split on whether lit produced an export
+at all. A workspace that *has* a store and still can't be exported from is one, because
+that is something that used to work and stopped. The other is everything downstream of a
+*successful* export — ClickHouse unable to run `lit` itself, a bridge script left pointing
+at the old workspace, an export whose shape or actor format has drifted out from under the
+views. Those are loud by design; the message for each names what to go look at.
 
 Each stage picks a session id before it emits anything and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still
@@ -477,8 +482,10 @@ A turn's `Model` is the model that produced the most main-loop output in it, not
 of any one request: turns run subagents on other models and pick up background Haiku calls,
 so the question is about the weight of the work.
 
-If `lit` can't be read, these views raise an error rather than returning no rows. That
-distinction is the whole point — "you have no tickets" and "I couldn't reach the tracker"
+If `lit` can't be read, `claude.ticket_events` and `claude.ticket_turns` raise an error
+rather than returning no rows. Only those two — `claude.session_turns` reads `claude.spans`
+and `claude.llm_requests` and never touches `lit`, so it keeps answering normally while the
+ticket views are failing. That distinction is the whole point — "you have no tickets" and "I couldn't reach the tracker"
 must not arrive as the same answer, or an average over nothing looks like a real number.
 When the ticket join is checked at all, `ct verify` re-checks both halves: that `lit`'s
 export still parses into the fields these views read, and that its actors are still session
