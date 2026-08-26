@@ -30,12 +30,6 @@ SINK_TIMEOUT_SECONDS=30
 # Long enough for an ordinary cleanup handler, short enough that a bound of N
 # seconds still means roughly N seconds.
 KILL_GRACE_SECONDS=5
-SELFTEST_SERVICE=claude-tracing-selftest
-
-# Claude Code's own resource service.name. cmd_env deliberately does not set
-# OTEL_SERVICE_NAME, so this is the name spans arrive under -- and cmd_env is why
-# that is true, which is what keeps this constant honest rather than a guess.
-CLAUDE_SERVICE_NAME=claude-code
 
 # --- service lifecycle ------------------------------------------------------
 # Every function below operates on a row of ct_services(). There is no
@@ -47,6 +41,115 @@ CLAUDE_SERVICE_NAME=claude-code
 ct_probe() { curl -fs --max-time 2 -o /dev/null "$1"; }
 
 ct_clickhouse_url() { printf 'http://127.0.0.1:%s/' "$CT_CLICKHOUSE_HTTP_PORT"; }
+
+# The environment variables a config file reads, one per line, whichever way it
+# spells the reference. Two spellings because two upstreams chose differently:
+# OpenTelemetry's `${env:NAME}` in collector.yaml and jaeger.yaml, ClickHouse's
+# `"@from_env": NAME` in clickhouse.yaml. Which one a file uses is a property of
+# whose config format it is, so it lives here as data rather than as a caller
+# that knows which service it is looking at. [LAW:one-type-per-behavior]
+#
+# A pattern that matched only one spelling would not fail -- it would find
+# nothing and report a clean config, which is the exact failure the guard below
+# exists to prevent, one level up. It did: until 2026-08-26 this matched only
+# the OTel form, so clickhouse.yaml's four variables were never checked while
+# the comment claimed every config was.
+ct_config_env_refs() {
+  local refs status=0
+
+  refs="$(grep -oE '\$\{env:[A-Za-z_][A-Za-z0-9_]*\}|"@from_env": *[A-Za-z_][A-Za-z0-9_]*' "$1")" \
+    || status=$?
+
+  # grep answers 1 for "nothing matched" and 2 for "I could not read that",
+  # opposite meanings wearing the same non-zero. A config that reads no
+  # environment at all is a legitimate config with nothing to check; one that
+  # cannot be read is a fault, and only the second is an error to report.
+  # [LAW:parse-dont-validate] the two are separated here, once, rather than
+  # left for each caller to guess at.
+  #
+  # Separating them is also what makes this function safe to call either way.
+  # Returning non-zero for the empty case is invisible through the process
+  # substitution ct_assert_config_env uses and fatal-with-no-message through a
+  # `x="$(...)"` assignment under set -e -- a function whose success depends on
+  # the caller's syntax is a seam, not a boundary.
+  [ "$status" -le 1 ] || ct_die "could not read $1 to find the environment it needs"
+  [ -n "$refs" ] || return 0
+
+  printf '%s\n' "$refs" \
+    | sed -E 's/^\$\{env:(.*)\}$/\1/; s/^"@from_env": *//' \
+    | sort -u
+}
+
+# True when a variable will reach a child process with a value -- which is to
+# say, exported and non-empty.
+#
+# Not `[ -n "${!var:-}" ]`, and the difference is the whole point. Indirect
+# expansion reads this shell's variable table and cannot see the export bit, so
+# a variable assigned in lib/common.sh but left off its `export` line answers
+# "present" here and arrives empty at the daemon two lines later -- the precise
+# scenario the die message below names as the usual cause. Measured: a
+# non-exported value reads back through `${!v}` and comes out empty in a child.
+#
+# `declare -p` prints the variable's attributes and fails for one that does not
+# exist. Its failure is the answer, not an error to report, which is why it is
+# branched on rather than surfaced.
+#
+# The pattern looks for x ANYWHERE in the flag cluster, because bash prints the
+# flags together in its own order rather than one per dash: an exported readonly
+# is `declare -rx NAME=...`, an exported integer `declare -ix`. Matching
+# "declare -x"* instead would call a perfectly exported variable unreachable and
+# kill a launch over a config that was fine -- the guard producing the false
+# result it exists to prevent. No CT_* constant is readonly today, which is
+# exactly why this had to be pinned by the case table rather than by the stack
+# happening to work.
+#
+# The cluster is cut out before it is matched rather than globbed for in the
+# whole line, so no variable's VALUE can be mistaken for its attributes.
+ct_var_reaches_children() {
+  local decl flags
+  decl="$(declare -p "$1" 2>/dev/null)" || return 1
+  flags="${decl#declare -}"
+  flags="${flags%% *}"
+  case "$flags" in
+    *x*) [ -n "${!1:-}" ] ;;
+    *)   return 1 ;;
+  esac
+}
+
+# Dies unless every environment variable a config file reads will reach the
+# process about to be started with it.
+#
+# [LAW:no-silent-failure] The collector does not need these to start. Handed an
+# unset variable it substitutes the empty string, logs one `warn` into a file
+# nobody is tailing, and runs -- and what it runs is not a degraded version of
+# the config, it is a different config. Measured on 2026-08-26 with only the two
+# service-name variables unset: the allowlist became `!= "" and != ""`, which is
+# true of every real signal, so the filter dropped 100% of the telemetry while
+# every port answered and `./ct status` read ready. That is the whole stack
+# silently recording nothing.
+#
+# [LAW:one-source-of-truth] The required set is grepped out of the config rather
+# than listed here. A config that starts reading a new variable is a config this
+# already covers, and there is no second list to fall behind -- which matters
+# because the failure this prevents is exactly a name going out of sync.
+ct_assert_config_env() {
+  local service="$1" config="$2" var
+  local -a missing=()
+
+  while read -r var; do
+    ct_var_reaches_children "$var" || missing+=("$var")
+  done < <(ct_config_env_refs "$config")
+
+  [ "${#missing[@]}" -eq 0 ] || ct_die "$config reads ${#missing[@]} environment variable(s) that will not reach $service:
+    ${missing[*]}
+  $service would start anyway, substituting the empty string, and answer its
+  readiness probe while behaving as something other than what the config says.
+  These come from lib/common.sh, and note that assigning one is not enough --
+  a name missing from that file's \`export\` lines is set in your shell and
+  absent from every process it launches, which is the usual cause. Compare
+  both the assignment and the export:
+    grep -n '${missing[0]}' lib/common.sh"
+}
 
 # One query, posted rather than URL-encoded, so a query containing anything at
 # all -- quotes, newlines, percent signs -- reaches ClickHouse as written.
@@ -98,16 +201,29 @@ ct_start_service() {
   fi
   [ -x "$bin" ] || ct_die "$name binary missing at $bin -- run './ct up'"
 
-  # [LAW:single-enforcer] One rule for both daemons: a service in this stack never
-  # exports its own telemetry into the stack. Jaeger self-traces to localhost:4317
-  # by default, and a shell that has sourced `./ct env` would hand both services
-  # the exporter contract meant for Claude. Either way you get the stack's own
-  # chatter stored beside your Claude traces. Neutralised once, here.
-  # BSD env insists every -u precede the first NAME=VALUE; GNU env accepts both.
+  # Every config this service was handed, checked before it is launched with it.
+  # Matching on the .yaml suffix rather than on a flag, because the three
+  # binaries disagree about how to be told where their config is and that
+  # disagreement lives in ct_services()'s argv, not here.
+  for arg in "$@"; do
+    case "$arg" in *.yaml) ct_assert_config_env "$name" "${arg#*=}" ;; esac
+  done
+
+  # A shell that has sourced `./ct env` is holding the exporter contract meant
+  # for Claude, and every daemon started from it would inherit that contract.
+  # Unset at the launch, so what a service does is a property of its config file
+  # and not of whose terminal it was started from.
+  #
+  # This is not what keeps the stack's own telemetry out of the store -- that
+  # rule is enforced once, in collector.yaml's filter/only_our_subjects, because
+  # the collector is the only place every signal crosses on the way to every
+  # sink. An OTEL_TRACES_EXPORTER=none stood here claiming the job until it was
+  # measured on 2026-08-26: jaeger emitted 30 spans per 30 query-API requests
+  # with it set and 31 without, so it had never suppressed one.
+  # [LAW:single-enforcer]
   nohup env \
     -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
     -u OTEL_EXPORTER_OTLP_HEADERS -u CLAUDE_CODE_ENABLE_TELEMETRY \
-    OTEL_TRACES_EXPORTER=none \
     "$@" >>"$(ct_logfile "$name")" 2>&1 &
   printf '%s\n' "$!" > "$(ct_pidfile "$name")"
   ct_await_ready "$name" "$ready"
@@ -493,9 +609,11 @@ cmd_claude() {
 # --- verification -----------------------------------------------------------
 # [LAW:verifiable-goals] "the stack is up" is not the goal; "this run's telemetry
 # is queryable in every sink the stack claims to have, and you can tell what work
-# it was doing" is. All three stages run every time, cheapest first, each
+# it was doing" is. All four stages run every time, cheapest first, each
 # isolating one thing: the label encoding, then the transport, then the thing you
-# actually came for.
+# actually came for -- and last, the mirror image of the two network stages,
+# which ask whether your data arrived. Stage 4 asks whether anything else did.
+# Stage 1 sends nothing and is outside that pairing entirely.
 #
 # A sink outside this definition of done has nothing holding it up, so it rots
 # and nobody is told -- which is how the metrics endpoint answered HTTP 200 with
@@ -526,6 +644,38 @@ EOF
 # the two rows about the one thing that differs between them.
 #
 # Fields: CT_SESSION_PURPOSE|what it should add to the label set
+# The config-env guard's two halves, as cases, for the same reason the encoding
+# above is: both halves have already shipped a silent pass. The reference
+# pattern matched one spelling and reported clickhouse.yaml clean while checking
+# none of its four variables; the export test used ${!var:-} and approved a
+# variable no child process could see. Neither failure showed up as a failure --
+# they showed up as a green run -- and both were caught by hand. A measurement
+# that is not written down is a measurement that happens once.
+# [LAW:behavior-not-structure] the cases assert what the guard must conclude,
+# never how it looks: swap grep for awk and these still pass.
+#
+# Fields: how the variable exists|does the guard say it reaches a child
+ct_export_cases() {
+  cat <<'EOF'
+exported and non-empty|yes
+assigned but never exported|no
+exported readonly|yes
+exported integer|yes
+exported but empty|no
+never declared at all|no
+EOF
+}
+
+# Fields: config line|the variable name it references
+ct_env_reference_cases() {
+  cat <<'EOF'
+        endpoint: 127.0.0.1:${env:CT_OTLP_GRPC_PORT}|CT_OTLP_GRPC_PORT
+  "@from_env": CT_CLICKHOUSE_HTTP_PORT|CT_CLICKHOUSE_HTTP_PORT
+        - resource.attributes["x"] != "${env:CT_CLAUDE_SERVICE_NAME}"|CT_CLAUDE_SERVICE_NAME
+  timeout: 2s|
+EOF
+}
+
 ct_label_cases() {
   cat <<'EOF'
 |
@@ -538,7 +688,7 @@ EOF
 # session that looks labelled and carries nothing.
 verify_labels() {
   local value expected actual root sandbox tail purpose contributed
-  ct_info "stage 1/3: label encoding (pure, no network)"
+  ct_info "stage 1/4: label encoding (pure, no network)"
 
   while IFS='|' read -r value expected; do
     actual="$(ct_percent_encode "$value")"
@@ -567,8 +717,67 @@ verify_labels() {
   done < <(ct_label_cases)
   rm -rf "$root"
 
+  verify_config_env_guard
+
   ct_ok "  encoding holds, a directory with no repo drops the vcs labels, and"
   ct_ok "  a session purpose rides in when there is one"
+  ct_ok "  the config-env guard reads both spellings and can tell exported from set"
+}
+
+# Exercises ct_config_env_refs and ct_var_reaches_children against their case
+# tables. Pure: a temp file and this shell's own variables, no network, no
+# stack. Runs inside stage 1 because that is where this repo puts logic whose
+# failures are quiet, and because a guard that runs before every daemon launch
+# should not be the one thing verify never checks.
+verify_config_env_guard() {
+  local line expected fixture found how reaches actual
+
+  fixture="$(mktemp)"
+  [ -f "$fixture" ] || ct_die "mktemp produced no file"
+  while IFS='|' read -r line expected; do
+    printf '%s\n' "$line" > "$fixture"
+    found="$(ct_config_env_refs "$fixture")"
+    [ "$found" = "$expected" ] || {
+      rm -f "$fixture"
+      ct_die "ct_config_env_refs read '$line' as '$found', expected '$expected'.
+  A spelling this misses is a config reported clean while nothing in it was
+  checked -- which is how clickhouse.yaml went unguarded."
+    }
+  done < <(ct_env_reference_cases)
+  rm -f "$fixture"
+
+  # Declared here rather than in the table because how a variable comes to exist
+  # is the thing under test, and bash has no way to say it as data.
+  #
+  # [LAW:effects-at-boundaries] `local` on every one of them, including the
+  # exported ones. A bare `export` inside a function is not scoped to it -- it
+  # becomes a global of the ct process and rides out into every child launched
+  # afterwards, which here would mean the real `claude` session stage 3 spawns:
+  # a test fixture reaching the subject this stack then traces. `local -x` is
+  # both at once -- function-scoped and visible to children, so it is still
+  # exactly what ct_var_reaches_children has to be able to see, and it is gone
+  # when this returns.
+  local -x CT_PROBE_PLAIN=value
+  local CT_PROBE_UNEXPORTED=value
+  local -rx CT_PROBE_READONLY=value
+  local -ix CT_PROBE_INT=7
+  local -x CT_PROBE_EMPTY=
+
+  while IFS='|' read -r how reaches; do
+    case "$how" in
+      "exported and non-empty")      ct_var_reaches_children CT_PROBE_PLAIN      && actual=yes || actual=no ;;
+      "assigned but never exported") ct_var_reaches_children CT_PROBE_UNEXPORTED && actual=yes || actual=no ;;
+      "exported readonly")           ct_var_reaches_children CT_PROBE_READONLY   && actual=yes || actual=no ;;
+      "exported integer")            ct_var_reaches_children CT_PROBE_INT        && actual=yes || actual=no ;;
+      "exported but empty")          ct_var_reaches_children CT_PROBE_EMPTY      && actual=yes || actual=no ;;
+      "never declared at all")       ct_var_reaches_children CT_PROBE_ABSENT     && actual=yes || actual=no ;;
+      *) ct_die "ct_export_cases has a row nothing here knows how to build: '$how'" ;;
+    esac
+    [ "$actual" = "$reaches" ] \
+      || ct_die "a variable that is '$how' should$([ "$reaches" = yes ] || printf ' NOT') reach a child, and the guard said $actual.
+  This decides whether a daemon launches, so a wrong answer either kills a
+  launch over a healthy config or waves through one that will run empty."
+  done < <(ct_export_cases)
 }
 
 # --- a run, and the four places it has to land ------------------------------
@@ -811,7 +1020,7 @@ selftest_span() {
   local needle="$1" now_ns="$2" trace_id
   trace_id="${needle//-/}"
   cat <<EOF
-{"resourceSpans":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+{"resourceSpans":[{"resource":{"attributes":[$(otlp_attr service.name "$CT_SELFTEST_SERVICE")]},
 "scopeSpans":[{"spans":[{"traceId":"$trace_id","spanId":"${trace_id:0:16}",
 "name":"ct.selftest","kind":1,
 "startTimeUnixNano":"$now_ns","endTimeUnixNano":"$((now_ns + 1000000))",
@@ -822,7 +1031,7 @@ EOF
 selftest_metric() {
   local needle="$1" now_ns="$2"
   cat <<EOF
-{"resourceMetrics":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+{"resourceMetrics":[{"resource":{"attributes":[$(otlp_attr service.name "$CT_SELFTEST_SERVICE")]},
 "scopeMetrics":[{"metrics":[{"name":"ct_selftest_runs","sum":{
 "aggregationTemporality":2,"isMonotonic":true,
 "dataPoints":[{"asInt":"1","startTimeUnixNano":"$now_ns","timeUnixNano":"$now_ns",
@@ -833,7 +1042,7 @@ EOF
 selftest_log() {
   local needle="$1" now_ns="$2"
   cat <<EOF
-{"resourceLogs":[{"resource":{"attributes":[$(otlp_attr service.name "$SELFTEST_SERVICE")]},
+{"resourceLogs":[{"resource":{"attributes":[$(otlp_attr service.name "$CT_SELFTEST_SERVICE")]},
 "scopeLogs":[{"logRecords":[{"timeUnixNano":"$now_ns",
 "body":{"stringValue":"ct.selftest"},
 "attributes":[$(otlp_attr session.id "$needle")]}]}]}]}
@@ -854,7 +1063,7 @@ verify_transport() {
   needle="$(ct_uuid)"
   now_ns=$(( $(date +%s) * 1000000000 ))
 
-  ct_info "stage 2/3: synthetic traces, metrics and logs -> collector -> every sink"
+  ct_info "stage 2/4: synthetic traces, metrics and logs -> collector -> every sink"
 
   while IFS='|' read -r signal payload; do
     curl -fsS --max-time 5 -o /dev/null \
@@ -867,7 +1076,7 @@ verify_transport() {
   # The fan-out means one sink can fail while the others pass, which is the whole
   # point of having four -- and the reason each is a separate assertion rather
   # than a second guess at the first one.
-  ct_await_run_in_every_sink "$SELFTEST_SERVICE" "$needle"
+  ct_await_run_in_every_sink "$CT_SELFTEST_SERVICE" "$needle"
   ct_ok "  transport works: session.id '$needle' is queryable in all four"
 }
 
@@ -879,7 +1088,7 @@ verify_transport() {
 # restatement: add, remove or rename a label and the expectation moves with it,
 # because there is no second list here to forget.
 claude_labels_searchable() {
-  ct_output_holds "$1" jaeger_traces_tagged "$CLAUDE_SERVICE_NAME" \
+  ct_output_holds "$1" jaeger_traces_tagged "$CT_CLAUDE_SERVICE_NAME" \
     "$(ct_join_labels jaeger_tag_of),$(jaeger_tag_of session.id "$1")"
 }
 
@@ -988,15 +1197,20 @@ verify_ticket_join() {
     ./ct sql \"SELECT DISTINCT Actor FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_EVENTS_VIEW FORMAT TSV\""
 
   ct_ok "  lit's history is readable, and its actors are session ids spans can be joined on"
+
+  # Offered by the check that just proved it answers, and by nothing else. The
+  # early returns above are the reason: a workspace with no ticket history, or
+  # none a Claude session moved, would print a query that correctly returns
+  # nothing and reads as a broken join. [LAW:no-silent-failure]
+  ct_trace "./ct sql \"SELECT Ticket, count() AS Turns, round(sum(CostUSD), 2) AS USD FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_TURNS_VIEW WHERE Completed GROUP BY Ticket FORMAT PrettyCompact\""
 }
 
 verify_claude() {
-  local ticket_hint=""
   local needle labels lit_status
   needle="$(ct_uuid)"
   labels="$(ct_work_labels)"
 
-  ct_info "stage 3/3: real claude session -> collector -> every sink"
+  ct_info "stage 3/4: real claude session -> collector -> every sink"
 
   # Run through the launcher rather than around it, so this stage covers the
   # path a real session takes -- labels included -- instead of a shortcut that
@@ -1010,7 +1224,7 @@ verify_claude() {
       -p "Run the bash command \`echo $needle\` and reply with nothing else." \
       >/dev/null ) || ct_die "the claude probe run failed"
 
-  ct_await_run_in_every_sink "$CLAUDE_SERVICE_NAME" "$needle"
+  ct_await_run_in_every_sink "$CT_CLAUDE_SERVICE_NAME" "$needle"
   ct_ok "  a real claude session reaches all four sinks"
 
   # No polling here, and that is a claim rather than an omission: the sink check
@@ -1121,7 +1335,6 @@ verify_claude() {
   case "${lit_status%%$'\t'*}" in
     ready)
       verify_ticket_join
-      ticket_hint="./ct sql \"SELECT Ticket, count() AS Turns, round(sum(CostUSD), 2) AS USD FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_TURNS_VIEW WHERE Completed GROUP BY Ticket FORMAT PrettyCompact\""
       ;;
     absent)
       ct_info "  no lit workspace answers at $CT_LIT_WORKSPACE -- ticket join not checked"
@@ -1134,18 +1347,143 @@ verify_claude() {
   ${lit_status#*$'\t'}"
       ;;
   esac
-  echo
-  ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
-  ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
-  ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
-  ct_trace "./ct sql \"SELECT round(sumIf(CostUSD, ServesToolCall), 2) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
-  [ -z "$ticket_hint" ] || ct_trace "$ticket_hint"
+}
+
+# ClickHouse's clock, not the shell's, so the window this run is judged over and
+# the timestamps it is judged against come from one source. Both processes are
+# on this machine and their clocks agree today; asking twice is how that stops
+# being true. [LAW:one-source-of-truth]
+#
+# now64(9) and not now(), matching the DateTime64(9) the two tables store. now()
+# floors to the whole second, so the mark would silently reach backwards to the
+# start of the second it was taken in, and a foreign row already written earlier
+# in that same second would be counted against this run -- a false failure in
+# exactly the case the time scoping exists to exclude.
+#
+# Its own function for the same reason ct_foreign_row_query is: the call that
+# DECIDES and the call that explains a failure must send the same bytes, or the
+# explanation answers about a query that never ran.
+ct_clickhouse_now_query() { printf '%s' "SELECT now64(9) FORMAT TSV"; }
+
+ct_clickhouse_now() {
+  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_clickhouse_now_query)"
+}
+
+# Rows written since $1 whose ServiceName is not one of this stack's subjects --
+# which is to say, rows that should not exist at all.
+#
+# Both durable stores, summed to one scalar. The events table carries the same
+# ServiceName column and is fed by the same filter, so counting spans alone
+# would be a check whose name is wider than its query -- the logs pipeline could
+# leak for a year while this reported clean. One UNION ALL rather than two
+# assertions because there is nothing per-store to say: the answer is a single
+# "how many rows exist that should not". [LAW:one-type-per-behavior]
+#
+# The Prometheus scrape is deliberately NOT here despite the same filter
+# covering it. It is a surface with a metric_expiration, so it forgets: an
+# assertion over it would read empty and pass on most runs whether or not the
+# metrics clause still worked, and a check that cannot fail advertises coverage
+# it does not have. What would have made a metrics-only regression possible --
+# three hand-synced copies of the OTTL condition -- is closed at the root
+# instead, by the YAML anchor in config/collector.yaml. [LAW:verifiable-goals]
+#
+# Scoped by time rather than by a before/after delta over the whole table. That
+# is what keeps two concurrent `./ct verify` runs from being judged against each
+# other's global counter, and it makes pollution that predates the filter
+# irrelevant by construction instead of by subtraction.
+#
+# The two names come from lib/common.sh, the same pair collector.yaml's
+# filter/only_our_subjects allows, so neither side can be renamed alone. The set
+# MEMBERSHIP is stated in both places, and that is what makes a divergence loud
+# rather than silent: narrow the filter and stage 2 dies with a sink that never
+# received the selftest run; widen it past this list and stage 4 below dies with
+# the new name in its hand.
+#
+# The SQL is its own function so that the call which DECIDES and the call which
+# EXPLAINS a failure send the same bytes -- ct_clickhouse_error re-asks without
+# -f to buy back the server's own message, and re-asking a different question
+# would answer about a query that never failed.
+ct_foreign_row_query() {
+  local since="$1" mine="'$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE'"
+  printf '%s' "SELECT sum(n) FROM (
+                 SELECT count() AS n FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
+                  WHERE Timestamp >= toDateTime64('$since', 9) AND ServiceName NOT IN ($mine)
+                  UNION ALL
+                 SELECT count() AS n FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_EVENTS_TABLE
+                  WHERE Timestamp >= toDateTime64('$since', 9) AND ServiceName NOT IN ($mine))
+               FORMAT TSV"
+}
+
+ct_foreign_row_count() {
+  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_row_query "$1")"
+}
+
+# [LAW:verifiable-goals] Asserts the rule where it can actually be observed. That
+# the filter is CONFIGURED is not the property -- a processor can be dropped from
+# a pipeline, an OTTL condition can be edited into something that matches
+# nothing, and the config still loads. The property is that a whole verify run
+# wrote nothing into either store that no subject of this stack emitted.
+#
+# What this catches is a filter that has stopped filtering, and it is worth
+# being exact about why that does not need a sleep. Stage 3 provokes self-traces
+# too -- jaeger_has_run and claude_labels_searchable both poll the Jaeger query
+# API late in the stage -- so the spans from the LAST such poll may still be
+# inside jaeger's own 5s batch window when this count runs, and this check does
+# not claim them. It does not need them: stage 2's polls fired a whole Claude
+# session ago, and a filter that regressed produced evidence then. A leak large
+# enough to matter cannot hide in the tail of one batch window.
+# [LAW:no-ambient-temporal-coupling] the check states the window it is
+# answerable for rather than betting on a delay that makes it look wider.
+verify_no_stack_telemetry() {
+  local since="$1" found
+  ct_info "stage 4/4: no foreign rows in the span or event store"
+
+  found="$(ct_foreign_row_count "$since")" \
+    || ct_die "could not count foreign rows written since $since.
+  ClickHouse answered a clock query earlier in this run, so an unreachable
+  server is the less likely of the two causes -- but this query is not that one,
+  and a store that has gone away mid-run and a query that was never going to
+  work both land here. ClickHouse's own message says which:
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_row_query "$since")")"
+
+  [ "$found" -eq 0 ] || ct_die "this run stored $found rows that no subject of this stack emitted.
+  Something now reaches a sink without crossing filter/only_our_subjects in
+  config/collector.yaml, or that filter no longer says what it used to. Jaeger
+  self-traces its own query API and is the usual author; the collector and
+  ClickHouse can acquire self-telemetry in any release.
+  Who it was, in the store that holds spans:
+    ./ct sql \"SELECT ServiceName, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE Timestamp >= toDateTime64('$since', 9) AND ServiceName NOT IN ('$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE') GROUP BY 1 FORMAT PrettyCompact\"
+  And in the one that holds events -- the same query against $CT_CLICKHOUSE_EVENTS_TABLE.
+  Whether the filter still sees them at all -- incoming should exceed outgoing:
+    curl -s http://127.0.0.1:$CT_COLLECTOR_TELEMETRY_PORT/metrics | grep only_our_subjects"
+
+  ct_ok "  nothing this stack's own daemons emitted reached either store"
 }
 
 cmd_verify() {
+  local run_start
+
   verify_labels
+
+  # Marked here and not at the top: stage 2 is the first thing to poll Jaeger's
+  # query API, and that poll is itself what provokes the leak this run must not
+  # commit, so the mark only has to precede stage 2. Stage 1 is pure by
+  # construction and stays that way -- it reports on the label encoding with the
+  # whole stack down, which is the point of running it first.
+  run_start="$(ct_clickhouse_now)" \
+    || ct_die "ClickHouse would not answer for the time -- is the stack up?
+    ./ct status
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_clickhouse_now_query)")"
+
   verify_transport
   verify_claude
+  verify_no_stack_telemetry "$run_start"
+
+  echo
+  ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CT_CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
+  ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
+  ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
+  ct_trace "./ct sql \"SELECT round(sumIf(CostUSD, ServesToolCall), 2) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
 }
 
 # --- dispatch ---------------------------------------------------------------
