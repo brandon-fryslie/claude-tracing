@@ -212,6 +212,93 @@ Three findings from building it, none of which were predictable from the span sc
   refuses to store as a column. Any boolean derived from `StopReason` needs an explicit
   `CAST(… AS Bool)`.
 
+### Dollars: derived from tokens, checked against Anthropic's own counter
+
+No span carries a cost, so dollars had to come from somewhere else. There were two
+places to get them, and they are not equivalent.
+
+Claude Code publishes a `claude_code_cost_usage_USD_total` counter on the metrics
+signal, and capturing it would have been the smaller job. Three things argued against
+it. It arrives at session grain, so it can never be split by `ServesToolCall` or by
+subagent type — and those splits are what every question in this epic needs. It cannot
+be backfilled, because the Prometheus surface holding it keeps no history. And it is
+not a different kind of fact from what the spans already carry: Anthropic computes it
+by multiplying token counts by a rate table, so storing it would mean keeping someone
+else's arithmetic and throwing the rate table away.
+
+Dollars are therefore derived here, per request, from the four token counts the span
+table has held since its first row. The rates live in `claude.model_prices`, and each
+count is multiplied by its own. That separation is the whole point: the four rates span
+a factor of fifty, so a single blended rate applied to `TotalTokens` lands wrong by a
+large factor while still looking like a reasonable number.
+
+The size of that error is easiest to see by comparing each component's share of the
+tokens against its share of the bill:
+
+| Component | Share of tokens | Share of spend |
+| --- | --- | --- |
+| Cache read | 97.5% | 61.5% |
+| Cache creation | 2.1% | 26.7% |
+| Output | 0.4% | 11.6% |
+
+A blended rate assumes those two columns are the same column. They are not: the cheapest
+component supplies almost all the tokens, and the two expensive ones supply almost
+40% of the bill from under 3% of them.
+
+**The counter is the oracle, not the source.** It is an independent computation of the
+same quantity, which makes it exactly the right thing to check the rate table against.
+Both metrics carry identical labels apart from a `type` label on the token counter, so
+matching them on every other label yields, per series, a dollar figure and the four
+token counts behind it. Solving those gives the rates. Measured 2026-08-23 across every
+series the endpoint exposed, and each reproduced as closely as the counter can state
+itself — it is serialised as a float64, so one series reads `2.6423449999999997` where
+the true figure is `2.642345`, a 3×10⁻¹⁶ gap that is the counter's rounding rather than
+the table's error. Computed in decimal here, the derived figure is the more exact of the
+two. The rates as of **that date**, per million tokens — every cell reconciled against the
+counter except the two marked †:
+
+| Model | Input | Cache read | Cache creation | Output |
+| --- | --- | --- | --- | --- |
+| `claude-opus-5[1m]` | $5.00 | $0.50 | $10.00 | $25.00 |
+| `claude-haiku-4-5-20251001` | $1.00 | $0.10 † | $2.00 † | $5.00 |
+
+† **Not reconciled.** No Haiku request in this store has ever touched the cache, so there
+was no series to solve these two against; they are Opus's published multipliers carried
+over. Every other cell above came back from the counter. The same distinction is recorded
+in the confidence table below.
+
+The six reconciled cells are a measurement, not a price list — frozen here the way every
+other figure in this document is frozen. The rates actually applied to queries live in
+`config/clickhouse.yaml`, which is the only file that governs billed dollars; if the two
+ever disagree, this table is the stale one and the script below is how to settle it.
+
+Three findings came out of the exercise:
+
+- **`[1m]` is a routing identifier, not a price tier.** `claude-opus-5[1m]` bills at
+  plain Opus 5 rates with no long-context premium. Assuming a premium would have
+  inflated every figure by whatever the assumed multiplier was.
+- **Cache creation is billed at 2× the input rate, not the 1.25× list figure.** The
+  multiplier is set by the cache TTL the request asked for — 1.25× at five minutes, 2×
+  at one hour — and Claude Code uses the one-hour TTL. No span records which TTL was
+  used, so this is the one rate that is a claim about how the client is configured
+  rather than a published price. Getting it wrong would be expensive: cache creation is
+  a quarter of the bill.
+- **The counter is a decaying window, not a ledger.** Summed across label sets it can go
+  *down* between two scrapes — 35,141 cache-creation tokens at one reading, 14,820 a few
+  minutes later — because the Prometheus exporter drops each series after
+  `metric_expiration` and a replacement starts from zero. Individual series are
+  internally consistent, which is what makes the per-series check above valid; the sum
+  over them is not a session total and must not be read as one.
+
+The check that keeps this honest is in `ct verify`, and it is deliberately not a
+comparison against the counter — the counter's expiry would make that flake. It asserts
+instead that every request in the probe session carries a price and that the session's
+total is above zero. That is the shape of the failure being guarded against: a model
+whose name changes stops matching the rate table, its rates come back as zeros, and its
+requests cost exactly nothing. Nothing errors and no row goes missing. Removing
+`claude-opus-5[1m]` from the rate table took one session from $13.44 to $0.0015 — a
+99.99% undercount that still reads like a number someone might believe.
+
 ## Confidence: measured, derived, assumed
 
 The first volume estimate in this investigation was wrong by 5× because a usage rate was
@@ -233,6 +320,11 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | Context delta after a `tool_use` request is always positive | **Measured** — all 124 consecutive pairs in the store, none negative |
 | Tool usage is 97.8% of tokens, tool output 0.8% | **Measured** — but on 145 requests from one day, not a month; re-run before quoting |
 | Subagent requests parent to `tool.execution`, not to `interaction` | **Measured** — hand-checked against session `c11da405` |
+| Per-MTok rates: all four for `claude-opus-5[1m]`, input and output for Haiku 4.5 | **Measured** — every metric series reproduced exactly from tokens × rate, 2026-08-23. Haiku's other two rates are the row below, not this one |
+| `claude-opus-5[1m]` carries no long-context price premium | **Measured** — same reconciliation; it bills at plain Opus 5 rates |
+| Cache creation bills at 2× input (the one-hour cache TTL) | **Measured** — solved from the counter; no span records the TTL, so it is a claim about this client's configuration |
+| Haiku 4.5 cache-read and cache-creation rates | **Assumed** — no Haiku request in this store has touched the cache; the published multipliers were carried over from Opus |
+| These rates were already in force before 2026-08-23 | **Unmeasured** — that is the date they were verified, not the date Anthropic set them. Rather than cost older spans at a rate nobody checked against them, the join leaves those spans `Priced = false` |
 
 The encoding result is worth stating on its own, because its failure mode is invisible.
 Two runs of the same prompt, one variable changed:
@@ -254,17 +346,25 @@ quietly, because a re-download looks exactly like a first install. The pin is ch
 now, against the bytes off the network, and the result is kept in a `.verified` file
 rather than re-derived from a file the program owns.
 
-Two live defects found along the way, both recorded as tickets:
+Two live defects found along the way, both since fixed:
 
-- The metrics endpoint on `:8889` answers `HTTP 200` with `Content-Length: 0`. The data
-  arrives — `otelcol_exporter_sent_metric_points{exporter="prometheus"} 7` — and then
-  evaporates, because a scrape surface drops series nothing pulls. An empty 200 is the
+- The metrics endpoint on `:8889` answered `HTTP 200` with `Content-Length: 0`. The data
+  arrived — `otelcol_exporter_sent_metric_points{exporter="prometheus"} 7` — and then
+  evaporated, because a scrape surface drops series nothing pulls. An empty 200 is the
   worst possible answer: shaped exactly like success, meaning *I lost your data*.
 - `ct verify` proved only that traces reach Jaeger, so the above rotted undetected for
   hours while verify passed. Any new sink needs to be inside verify's definition of done,
   or it will rot the same way. Work-unit labels were brought inside it when they landed —
-  verify now tag-searches Jaeger for the labels the probe session was launched with. The
-  metrics endpoint still isn't covered; that's ticket 3.
+  verify now tag-searches Jaeger for the labels the probe session was launched with — and
+  the metrics endpoint was brought inside it with the sink table, which is the structural
+  version of the same fix: a sink is a row there, so a new one cannot arrive with a weaker
+  standard than the four.
+
+That endpoint was expected to be retired once cost was solved, on the grounds that
+nothing read it. It earned its keep instead. Because it publishes Anthropic's own
+independent computation of cost, it is the only thing in the stack that can check the
+derived dollars against an outside authority — which is how the rate table above was
+established, and how a future price change gets caught.
 
 ## Re-measuring
 
@@ -324,6 +424,61 @@ Once there is a real month in ClickHouse, this settles the 150–400 MB/year est
           WHERE database = 'claude' AND table = 'spans' AND active
           GROUP BY partition ORDER BY partition FORMAT PrettyCompact"
 ```
+
+Per-token rates, reconciled against Claude Code's own cost counter. This is the one
+measurement here that decides billed dollars, so it is the one most worth re-running
+rather than trusting — after a suspected price change, or when `ct verify` reports an
+unpriced model and a rate has to be established for it.
+
+It reads the live scrape surface, so **the stack must be up and a session must have run
+within the last few minutes** — series vanish after `metric_expiration`. Each series is
+checked independently; a series is only meaningful if its cost and token counters were
+scraped together, which is why nothing here sums across label sets.
+
+```bash
+curl -fsS http://127.0.0.1:8889/metrics > /tmp/ct-metrics.txt && python3 -c "
+import re, sys, collections
+from decimal import Decimal, getcontext
+getcontext().prec = 50
+# The rates under test. Copy these from config/clickhouse.yaml, then see if they hold.
+RATE = {
+ 'claude-opus-5[1m]':         dict(input='5.0', cacheRead='0.5', cacheCreation='10.0', output='25.0'),
+ 'claude-opus-5':             dict(input='5.0', cacheRead='0.5', cacheCreation='10.0', output='25.0'),
+ 'claude-haiku-4-5-20251001': dict(input='1.0', cacheRead='0.1', cacheCreation='2.0',  output='5.0'),
+}
+cost, toks = {}, collections.defaultdict(dict)
+for line in open('/tmp/ct-metrics.txt'):
+    m = re.match(r'^claude_code_(cost_usage_USD|token_usage_tokens)_total\{(.*)\} (\S+)$', line.strip())
+    if not m: continue
+    kind, labels, val = m.group(1), m.group(2), Decimal(m.group(3))
+    d = dict(re.findall(r'(\w+)=\"([^\"]*)\"', labels))
+    ttype = d.pop('type', None)          # the only label that differs between the two metrics
+    key = tuple(sorted(d.items()))       # so everything else identifies one series
+    if kind == 'cost_usage_USD': cost[key] = max(cost.get(key, Decimal(0)), val)
+    else: toks[key][ttype] = max(toks[key].get(ttype, Decimal(0)), val)
+for key, usd in sorted(cost.items(), key=lambda kv: -kv[1]):
+    model = dict(key)['model']
+    if model not in RATE: print(f'{model:<28} NO RATE UNDER TEST -- solve for it'); continue
+    t = toks.get(key, {})
+    # A 'type' label this script has no rate for is the failure that would otherwise
+    # pass quietly: its tokens contribute nothing, so 'derived' lands low and the
+    # residual reads as a rate that drifted rather than a bucket nobody priced. An
+    # absent label is fine -- that is a bucket the session never used -- but an
+    # unrecognised one means the export changed shape and no number below is safe.
+    unknown = sorted(set(t) - set(RATE[model]))
+    if unknown: print(f'{model:<28} UNPRICED TOKEN TYPE {unknown} -- export changed; add rates for these before trusting any figure here'); continue
+    derived = sum((t.get(k, Decimal(0)) * Decimal(RATE[model][k]) / 1000000 for k in RATE[model]), Decimal(0))
+    diff = derived - usd
+    # The counter is a float64 and cannot state its own values exactly, so a residual
+    # around 1e-16 is its rounding. Anything larger is a rate that no longer holds.
+    print(f'{model:<28} counter={usd:<22} derived={derived:<22} {\"OK\" if abs(diff) < Decimal(\"1e-12\") else f\"MISMATCH {diff:+}\"}')
+"
+```
+
+A model printing `NO RATE UNDER TEST` is one to solve for: three of its four rates are
+published list prices (input, output, and cache read at a tenth of input), so multiply
+those out, subtract from the counter, and divide the remainder by the cache-creation
+tokens to get the last one.
 
 ## Where this is tracked
 

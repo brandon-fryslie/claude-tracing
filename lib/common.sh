@@ -51,6 +51,21 @@ CT_CLICKHOUSE_TABLE=spans
 # query; here, the `ct verify` assertion that queries this view by name.
 CT_CLICKHOUSE_REQUESTS_VIEW=llm_requests
 
+# The rate table the request view multiplies token counts against to get dollars.
+#
+# Unlike the two names above, this one buys no drift protection at all, and the
+# distinction is worth stating rather than glossing: those are interpolated into
+# SQL that runs, so a stale name is a query ClickHouse rejects. This appears only
+# in the text of a message, so a rename in config/clickhouse.yaml would leave the
+# guidance pointing at something that no longer exists and nothing would say so.
+#
+# It is here for one spelling of a name used in guidance, and nothing more. What
+# actually holds the name true is upstream: claude.llm_requests selects from this
+# view, so a renamed or missing price table fails CREATE VIEW at startup under
+# throw_on_error and ClickHouse never becomes ready. [LAW:single-enforcer] that
+# invariant has exactly one enforcer and does not need a second here.
+CT_CLICKHOUSE_PRICES_VIEW=model_prices
+
 # How long spans survive on disk before badger expires them.
 #
 # ClickHouse's own retention is not here, and deliberately: it is a TTL clause
@@ -67,6 +82,7 @@ export CT_JAEGER_OTLP_PORT CT_JAEGER_UI_PORT CT_JAEGER_HEALTH_PORT
 export CT_JAEGER_TELEMETRY_PORT CT_TRACE_TTL
 export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
 export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_REQUESTS_VIEW
+export CT_CLICKHOUSE_PRICES_VIEW
 
 # --- pinned tool releases ---------------------------------------------------
 CT_JAEGER_VERSION=2.20.0
