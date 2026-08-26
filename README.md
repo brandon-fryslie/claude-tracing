@@ -44,22 +44,22 @@ session ids spans can be joined on. With no `lit`, no tickets in it, or no ticke
 session has moved — including a checkout nobody ran `lit init` in — it says so and carries
 on: the telemetry path does not depend on an issue tracker this stack doesn't install.
 
-The fourth stage asks the opposite question of the first three: not whether your data
-arrived, but whether anything else did. It marks the time before the run starts, then
-counts the rows written since — in both the span store and the event store — from a
-service that is neither Claude Code nor verify's own probe, and fails if it finds any.
-Jaeger self-traces its own query API, which verify polls dozens of times per run, so
-without something stopping it the stack quietly files about a hundred spans about itself
-per verify and "how big is my history" answers wrong for a year. The collector drops them
-on the way in; this stage is what would notice if it stopped. Spans that were already
-there before the run began are history rather than a fault, and it does not judge them.
-
 Two kinds of lit trouble do fail the run, and they split on whether lit produced an export
 at all. A workspace that *has* a store and still can't be exported from is one, because
 that is something that used to work and stopped. The other is everything downstream of a
 *successful* export — ClickHouse unable to run `lit` itself, a bridge script left pointing
 at the old workspace, an export whose shape or actor format has drifted out from under the
 views. Those are loud by design; the message for each names what to go look at.
+
+The fourth stage asks the opposite question of the first three: not whether your data
+arrived, but whether anything else did. It marks the time before the network stages begin,
+then counts the rows written since — in both the span store and the event store — from a
+service that is neither Claude Code nor verify's own probe, and fails if it finds any.
+Jaeger self-traces its own query API, which verify polls dozens of times per run, so
+without something stopping it the stack quietly files about a hundred spans about itself
+per verify and "how big is my history" answers wrong for a year. The collector drops them
+on the way in; this stage is what would notice if it stopped. Spans that were already
+there before the run began are history rather than a fault, and it does not judge them.
 
 Each stage that emits anything picks a session id first and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still

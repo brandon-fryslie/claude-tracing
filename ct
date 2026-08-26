@@ -42,6 +42,40 @@ ct_probe() { curl -fs --max-time 2 -o /dev/null "$1"; }
 
 ct_clickhouse_url() { printf 'http://127.0.0.1:%s/' "$CT_CLICKHOUSE_HTTP_PORT"; }
 
+# Dies unless every ${env:VAR} a config file references is set and non-empty in
+# this process's environment.
+#
+# [LAW:no-silent-failure] The collector does not need these to start. Handed an
+# unset variable it substitutes the empty string, logs one `warn` into a file
+# nobody is tailing, and runs -- and what it runs is not a degraded version of
+# the config, it is a different config. Measured on 2026-08-26 with only the two
+# service-name variables unset: the allowlist became `!= "" and != ""`, which is
+# true of every real signal, so the filter dropped 100% of the telemetry while
+# every port answered and `./ct status` read ready. That is the whole stack
+# silently recording nothing.
+#
+# [LAW:one-source-of-truth] The required set is grepped out of the config rather
+# than listed here. A config that starts reading a new variable is a config this
+# already covers, and there is no second list to fall behind -- which matters
+# because the failure this prevents is exactly a name going out of sync.
+ct_assert_config_env() {
+  local service="$1" config="$2" var
+  local -a missing=()
+
+  while read -r var; do
+    [ -n "${!var:-}" ] || missing+=("$var")
+  done < <(grep -oE '\$\{env:[A-Za-z_][A-Za-z0-9_]*\}' "$config" \
+             | sed 's/^\${env://; s/}$//' | sort -u)
+
+  [ "${#missing[@]}" -eq 0 ] || ct_die "$config reads ${#missing[@]} environment variable(s) this shell does not set:
+    ${missing[*]}
+  $service would start anyway, substituting the empty string, and answer its
+  readiness probe while behaving as something other than what the config says.
+  These come from lib/common.sh -- an assignment there that lost its export is
+  the usual cause. Compare:
+    grep -n '${missing[0]}' lib/common.sh"
+}
+
 # One query, posted rather than URL-encoded, so a query containing anything at
 # all -- quotes, newlines, percent signs -- reaches ClickHouse as written.
 #
@@ -91,6 +125,14 @@ ct_start_service() {
     return 0
   fi
   [ -x "$bin" ] || ct_die "$name binary missing at $bin -- run './ct up'"
+
+  # Every config this service was handed, checked before it is launched with it.
+  # Matching on the .yaml suffix rather than on a flag, because the three
+  # binaries disagree about how to be told where their config is and that
+  # disagreement lives in ct_services()'s argv, not here.
+  for arg in "$@"; do
+    case "$arg" in *.yaml) ct_assert_config_env "$name" "${arg#*=}" ;; esac
+  done
 
   # A shell that has sourced `./ct env` is holding the exporter contract meant
   # for Claude, and every daemon started from it would inherit that contract.
@@ -1144,8 +1186,14 @@ verify_claude() {
 # the timestamps it is judged against come from one source. Both processes are
 # on this machine and their clocks agree today; asking twice is how that stops
 # being true. [LAW:one-source-of-truth]
+#
+# now64(9) and not now(), matching the DateTime64(9) the two tables store. now()
+# floors to the whole second, so the mark would silently reach backwards to the
+# start of the second it was taken in, and a foreign row already written earlier
+# in that same second would be counted against this run -- a false failure in
+# exactly the case the time scoping exists to exclude.
 ct_clickhouse_now() {
-  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "SELECT now() FORMAT TSV"
+  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "SELECT now64(9) FORMAT TSV"
 }
 
 # Rows written since $1 whose ServiceName is not one of this stack's subjects --
@@ -1186,10 +1234,10 @@ ct_foreign_row_query() {
   local since="$1" mine="'$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE'"
   printf '%s' "SELECT sum(n) FROM (
                  SELECT count() AS n FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
-                  WHERE Timestamp >= toDateTime('$since') AND ServiceName NOT IN ($mine)
+                  WHERE Timestamp >= toDateTime64('$since', 9) AND ServiceName NOT IN ($mine)
                   UNION ALL
                  SELECT count() AS n FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_EVENTS_TABLE
-                  WHERE Timestamp >= toDateTime('$since') AND ServiceName NOT IN ($mine))
+                  WHERE Timestamp >= toDateTime64('$since', 9) AND ServiceName NOT IN ($mine))
                FORMAT TSV"
 }
 
@@ -1219,8 +1267,10 @@ verify_no_stack_telemetry() {
 
   found="$(ct_foreign_row_count "$since")" \
     || ct_die "could not count foreign rows written since $since.
-  The same query answered before stage 1, so this is ClickHouse going away
-  mid-run rather than a query that was never going to work.
+  ClickHouse answered a clock query earlier in this run, so an unreachable
+  server is the less likely of the two causes -- but this query is not that one,
+  and a store that has gone away mid-run and a query that was never going to
+  work both land here. ClickHouse's own message says which:
   $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_row_query "$since")")"
 
   [ "$found" -eq 0 ] || ct_die "this run stored $found rows that no subject of this stack emitted.
@@ -1229,7 +1279,7 @@ verify_no_stack_telemetry() {
   self-traces its own query API and is the usual author; the collector and
   ClickHouse can acquire self-telemetry in any release.
   Who it was, in the store that holds spans:
-    ./ct sql \"SELECT ServiceName, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE Timestamp >= toDateTime('$since') AND ServiceName NOT IN ('$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE') GROUP BY 1 FORMAT PrettyCompact\"
+    ./ct sql \"SELECT ServiceName, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE Timestamp >= toDateTime64('$since', 9) AND ServiceName NOT IN ('$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE') GROUP BY 1 FORMAT PrettyCompact\"
   And in the one that holds events -- the same query against $CT_CLICKHOUSE_EVENTS_TABLE.
   Whether the filter still sees them at all -- incoming should exceed outgoing:
     curl -s http://127.0.0.1:$CT_COLLECTOR_TELEMETRY_PORT/metrics | grep only_our_subjects"
@@ -1240,14 +1290,18 @@ verify_no_stack_telemetry() {
 cmd_verify() {
   local run_start
 
-  # Marked before stage 1, because stage 2 polls Jaeger's query API and that poll
-  # is itself what provokes the leak this run must not commit.
+  verify_labels
+
+  # Marked here and not at the top: stage 2 is the first thing to poll Jaeger's
+  # query API, and that poll is itself what provokes the leak this run must not
+  # commit, so the mark only has to precede stage 2. Stage 1 is pure by
+  # construction and stays that way -- it reports on the label encoding with the
+  # whole stack down, which is the point of running it first.
   run_start="$(ct_clickhouse_now)" \
     || ct_die "ClickHouse would not answer for the time -- is the stack up?
     ./ct status
-  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" 'SELECT now() FORMAT TSV')"
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" 'SELECT now64(9) FORMAT TSV')"
 
-  verify_labels
   verify_transport
   verify_claude
   verify_no_stack_telemetry "$run_start"
