@@ -70,15 +70,29 @@ ct_config_env_refs() {
 # scenario the die message below names as the usual cause. Measured: a
 # non-exported value reads back through `${!v}` and comes out empty in a child.
 #
-# `declare -p` prints `declare -x NAME=...` only for an exported variable and
-# fails for one that does not exist. Its failure is the answer, not an error to
-# report, which is why it is branched on rather than surfaced.
+# `declare -p` prints the variable's attributes and fails for one that does not
+# exist. Its failure is the answer, not an error to report, which is why it is
+# branched on rather than surfaced.
+#
+# The pattern looks for x ANYWHERE in the flag cluster, because bash prints the
+# flags together in its own order rather than one per dash: an exported readonly
+# is `declare -rx NAME=...`, an exported integer `declare -ix`. Matching
+# "declare -x"* instead would call a perfectly exported variable unreachable and
+# kill a launch over a config that was fine -- the guard producing the false
+# result it exists to prevent. No CT_* constant is readonly today, which is
+# exactly why this had to be pinned by the case table rather than by the stack
+# happening to work.
+#
+# The cluster is cut out before it is matched rather than globbed for in the
+# whole line, so no variable's VALUE can be mistaken for its attributes.
 ct_var_reaches_children() {
-  local decl
+  local decl flags
   decl="$(declare -p "$1" 2>/dev/null)" || return 1
-  case "$decl" in
-    "declare -x"*) [ -n "${!1}" ] ;;
-    *)             return 1 ;;
+  flags="${decl#declare -}"
+  flags="${flags%% *}"
+  case "$flags" in
+    *x*) [ -n "${!1:-}" ] ;;
+    *)   return 1 ;;
   esac
 }
 
@@ -577,8 +591,9 @@ cmd_claude() {
 # is queryable in every sink the stack claims to have, and you can tell what work
 # it was doing" is. All four stages run every time, cheapest first, each
 # isolating one thing: the label encoding, then the transport, then the thing you
-# actually came for -- and last, the mirror image of the other three, which ask
-# whether your data arrived. Stage 4 asks whether anything else did.
+# actually came for -- and last, the mirror image of the two network stages,
+# which ask whether your data arrived. Stage 4 asks whether anything else did.
+# Stage 1 sends nothing and is outside that pairing entirely.
 #
 # A sink outside this definition of done has nothing holding it up, so it rots
 # and nobody is told -- which is how the metrics endpoint answered HTTP 200 with
@@ -609,6 +624,37 @@ EOF
 # the two rows about the one thing that differs between them.
 #
 # Fields: CT_SESSION_PURPOSE|what it should add to the label set
+# The config-env guard's two halves, as cases, for the same reason the encoding
+# above is: both halves have already shipped a silent pass. The reference
+# pattern matched one spelling and reported clickhouse.yaml clean while checking
+# none of its four variables; the export test used ${!var:-} and approved a
+# variable no child process could see. Neither failure showed up as a failure --
+# they showed up as a green run -- and both were caught by hand. A measurement
+# that is not written down is a measurement that happens once.
+# [LAW:behavior-not-structure] the cases assert what the guard must conclude,
+# never how it looks: swap grep for awk and these still pass.
+#
+# Fields: how the variable exists|does the guard say it reaches a child
+ct_export_cases() {
+  cat <<'EOF'
+exported and non-empty|yes
+assigned but never exported|no
+exported readonly|yes
+exported integer|yes
+exported but empty|no
+never declared at all|no
+EOF
+}
+
+# Fields: config line|the variable name it references
+ct_env_reference_cases() {
+  cat <<'EOF'
+        endpoint: 127.0.0.1:${env:CT_OTLP_GRPC_PORT}|CT_OTLP_GRPC_PORT
+  "@from_env": CT_CLICKHOUSE_HTTP_PORT|CT_CLICKHOUSE_HTTP_PORT
+        - resource.attributes["x"] != "${env:CT_CLAUDE_SERVICE_NAME}"|CT_CLAUDE_SERVICE_NAME
+EOF
+}
+
 ct_label_cases() {
   cat <<'EOF'
 |
@@ -650,8 +696,58 @@ verify_labels() {
   done < <(ct_label_cases)
   rm -rf "$root"
 
+  verify_config_env_guard
+
   ct_ok "  encoding holds, a directory with no repo drops the vcs labels, and"
   ct_ok "  a session purpose rides in when there is one"
+  ct_ok "  the config-env guard reads both spellings and can tell exported from set"
+}
+
+# Exercises ct_config_env_refs and ct_var_reaches_children against their case
+# tables. Pure: a temp file and this shell's own variables, no network, no
+# stack. Runs inside stage 1 because that is where this repo puts logic whose
+# failures are quiet, and because a guard that runs before every daemon launch
+# should not be the one thing verify never checks.
+verify_config_env_guard() {
+  local line expected fixture found how reaches actual
+
+  fixture="$(mktemp)"
+  [ -f "$fixture" ] || ct_die "mktemp produced no file"
+  while IFS='|' read -r line expected; do
+    printf '%s\n' "$line" > "$fixture"
+    found="$(ct_config_env_refs "$fixture")"
+    [ "$found" = "$expected" ] || {
+      rm -f "$fixture"
+      ct_die "ct_config_env_refs read '$line' as '$found', expected '$expected'.
+  A spelling this misses is a config reported clean while nothing in it was
+  checked -- which is how clickhouse.yaml went unguarded."
+    }
+  done < <(ct_env_reference_cases)
+  rm -f "$fixture"
+
+  # Declared here rather than in the table because how a variable comes to exist
+  # is the thing under test, and bash has no way to say it as data.
+  export CT_PROBE_PLAIN=value
+  CT_PROBE_UNEXPORTED=value
+  declare -rx CT_PROBE_READONLY=value
+  declare -ix CT_PROBE_INT=7
+  export CT_PROBE_EMPTY=
+
+  while IFS='|' read -r how reaches; do
+    case "$how" in
+      "exported and non-empty")      ct_var_reaches_children CT_PROBE_PLAIN      && actual=yes || actual=no ;;
+      "assigned but never exported") ct_var_reaches_children CT_PROBE_UNEXPORTED && actual=yes || actual=no ;;
+      "exported readonly")           ct_var_reaches_children CT_PROBE_READONLY   && actual=yes || actual=no ;;
+      "exported integer")            ct_var_reaches_children CT_PROBE_INT        && actual=yes || actual=no ;;
+      "exported but empty")          ct_var_reaches_children CT_PROBE_EMPTY      && actual=yes || actual=no ;;
+      "never declared at all")       ct_var_reaches_children CT_PROBE_ABSENT     && actual=yes || actual=no ;;
+      *) ct_die "ct_export_cases has a row nothing here knows how to build: '$how'" ;;
+    esac
+    [ "$actual" = "$reaches" ] \
+      || ct_die "a variable that is '$how' should$([ "$reaches" = yes ] || printf ' NOT') reach a child, and the guard said $actual.
+  This decides whether a daemon launches, so a wrong answer either kills a
+  launch over a healthy config or waves through one that will run empty."
+  done < <(ct_export_cases)
 }
 
 # --- a run, and the four places it has to land ------------------------------

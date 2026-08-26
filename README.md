@@ -51,8 +51,8 @@ that is something that used to work and stopped. The other is everything downstr
 at the old workspace, an export whose shape or actor format has drifted out from under the
 views. Those are loud by design; the message for each names what to go look at.
 
-The fourth stage asks the opposite question of the first three: not whether your data
-arrived, but whether anything else did. It marks the time before the network stages begin,
+The fourth stage asks the opposite question of the two that touch the network: not whether
+your data arrived, but whether anything else did. It marks the time before the network stages begin,
 then counts the rows written since — in both the span store and the event store — from a
 service that is neither Claude Code nor verify's own probe, and fails if it finds any.
 Jaeger self-traces its own query API, which verify polls dozens of times per run, so
