@@ -291,6 +291,20 @@ startup_scripts:
           Repository         LowCardinality(String) MATERIALIZED ResourceAttributes['vcs.repository.name'],
           Branch             LowCardinality(String) MATERIALIZED ResourceAttributes['vcs.ref.head.name'],
 
+          -- SpanId is the join key the comment above sends readers to, and it is
+          -- in neither the sort key nor any map index, so it gets its own -- the
+          -- same instrument and tolerance idx_trace_id uses on spans, for the
+          -- same reason: a per-row identifier is what a bloom filter is for.
+          --
+          -- What it buys is the POINT LOOKUP -- `WHERE SpanId = '...'`, which is
+          -- how you go from one span to the events inside it. It does not make
+          -- an unfiltered year-wide `events JOIN spans ON SpanId` cheap: a hash
+          -- join builds from one side and scans the other, and a skip index
+          -- prunes granules only when a WHERE selects them. Filter by Body,
+          -- SessionId or a time range first -- the sort key and the monthly
+          -- partitions prune those -- and join the remainder.
+          INDEX idx_span_id        SpanId                        TYPE bloom_filter(0.001) GRANULARITY 1,
+
           INDEX idx_log_attr_key   mapKeys(LogAttributes)        TYPE bloom_filter(0.01) GRANULARITY 1,
           INDEX idx_log_attr_value mapValues(LogAttributes)      TYPE bloom_filter(0.01) GRANULARITY 1,
           INDEX idx_res_attr_key   mapKeys(ResourceAttributes)   TYPE bloom_filter(0.01) GRANULARITY 1,
