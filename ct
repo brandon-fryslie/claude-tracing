@@ -858,14 +858,13 @@ EOF
 }
 
 # Runs first because it is the cheapest stage and nothing downstream means
-# anything if it fails. Cheapest is not free: measured at 3.9-4.1s over five
+# anything if it fails. Cheapest is not free: measured at 3.9-4.4s over five
 # runs, of which all but a fraction is two fixtures being watched for a bounded
 # interval to prove a process is STILL THERE -- an observation that cannot be
-# hurried, only skipped. Every other check here costs milliseconds, or a fraction
-# of a second where it has to fork once per case as the log-set table does, which
-# is why adding them changed the total by nothing measurable: with and without
-# the log checks, interleaved over five pairs, the difference stayed inside the
-# run-to-run spread. Compare the minute a full run spends on stages 2 to 4.
+# hurried, only skipped. Every other check here costs around a tenth of a second,
+# which is why adding one moves the total by less than the spread between runs:
+# measured interleaved, five pairs, against the same stage without the log
+# checks. Compare the minute a full run spends on stages 2 to 4.
 #
 # Everything under it decides something before a byte leaves the host:
 # what a session is labelled, whether a daemon may launch, whether a stopped
@@ -992,11 +991,6 @@ verify_service_logs() {
   # A fresh directory per row rather than one emptied between rows, because
   # emptying it means globbing it, and a glob that matches nothing is the bug
   # under test.
-  #
-  # The paths come back and are trimmed in-shell rather than through sed and
-  # paste. That is not tidiness: this host forks at roughly 40ms, measured, so
-  # the two-process pipeline this replaces cost more than every other assertion
-  # in stage 1 put together.
   while IFS='|' read -r present expected; do
     dir="$root/$((row++))"
     mkdir -p "$dir"
