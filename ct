@@ -270,7 +270,11 @@ ct_record_pid() {
   written -- killed it rather than leave a process nothing can see."
 }
 
-ct_process_gone() { ! kill -0 "$1" 2>/dev/null; }
+# The negation, and nothing else: ct_poll_until takes a condition as a command,
+# and "keep waiting until it is gone" is that condition. Derived rather than
+# written, so there is no second opinion about what gone means.
+# [LAW:one-source-of-truth]
+ct_process_gone() { ! ct_process_exists "$1"; }
 
 # Signals a pid and waits for it to stop existing. True when it is gone.
 #
@@ -282,10 +286,16 @@ ct_process_gone() { ! kill -0 "$1" 2>/dev/null; }
 # question is shared. [LAW:single-enforcer]
 #
 # `kill`s stderr is deliberately not discarded. The benign race it would hide --
-# a process exiting between ct_pid_of's own kill -0 and this signal -- is
-# microseconds wide, while the failure it would also hide (EPERM, a pid this
-# user may not signal) is the one thing an operator staring at a service that
-# will not stop needs to see. [LAW:no-silent-failure]
+# a process exiting between ct_pid_of's read and this signal -- is microseconds
+# wide, while the failure it would also hide (EPERM, a pid this user may not
+# signal) is the one thing an operator staring at a service that will not stop
+# needs to see. [LAW:no-silent-failure]
+#
+# What makes that sentence true is one line down, in ct_process_exists: a
+# refused signal falls to a predicate that says the process is still there, so
+# the function returns failure and the caller speaks up. Against a kill-based
+# predicate the same EPERM read as "gone" and this reported success over a
+# living process -- the failure was not merely unsurfaced, it was inverted.
 ct_signal_until_gone() {
   local signal="$1" pid="$2" seconds="$3"
   kill -"$signal" "$pid" || ct_process_gone "$pid" || return 1
@@ -768,10 +778,11 @@ EOF
 
 # Runs first because it is the cheapest stage and nothing downstream means
 # anything if it fails. Cheapest is not free: measured at 3.9-4.1s over five
-# runs, where the first two checks are milliseconds and the rest is two fixtures
-# being watched for a bounded interval to prove a process is still there --
-# which is an observation that cannot be hurried, only skipped. Compare the
-# minute a full run spends on stages 2 to 4.
+# runs, of which all but a fraction is two fixtures being watched for a bounded
+# interval to prove a process is STILL THERE -- an observation that cannot be
+# hurried, only skipped. Every other check here costs milliseconds, which is why
+# adding them changed the total by nothing measurable. Compare the minute a full
+# run spends on stages 2 to 4.
 #
 # Everything under it decides something before a byte leaves the host:
 # what a session is labelled, whether a daemon may launch, whether a stopped
@@ -781,6 +792,7 @@ verify_pure() {
   ct_info "stage 1/4: local logic (no network, no stack)"
   verify_label_encoding
   verify_config_env_guard
+  verify_process_liveness
   verify_start_service_record
   verify_stop_service_record
 }
@@ -877,6 +889,118 @@ verify_config_env_guard() {
   done < <(ct_export_cases)
 
   ct_ok "  the config-env guard reads both spellings and can tell exported from set"
+}
+
+# Everything below rests on this one question, so it is asked first and asked as
+# data. Both halves of the invariant -- a record removed only when the process
+# is gone, a process gone before a launch gives up on it -- are decided by
+# ct_process_exists, and a predicate that is wrong about a live process makes
+# every row underneath agree with it.
+#
+# The middle row is the one that matters and the one that costs nothing to set
+# up: pid 1 is launchd, alive on every darwin box and signalable by nobody but
+# root. It is the state a kill-based predicate cannot see -- the process exists,
+# the signal is refused, and the shell is told only that the call failed.
+#
+# Which pids this stage may signal is the third column rather than a comparison
+# against the number 1, so "borrowed, never signalled" is a property of the row
+# and not a rule someone has to notice further down. `ct_process_exists` only
+# ever runs `ps`; under a root-run verify a real TERM to launchd would end the
+# session and everything in it.
+#
+# Fields: what the pid is|does the predicate say it exists|is it ours to kill
+ct_liveness_cases() {
+  cat <<'EOF'
+a process this shell started|yes|yes
+a live process this user may not signal|yes|no
+a process that has exited|no|no
+EOF
+}
+
+verify_process_liveness() {
+  local what expects mine pid actual
+
+  while IFS='|' read -r what expects mine; do
+    case "$what" in
+      "a process this shell started")           pid="$(ct_fixture_process "exits on TERM")" ;;
+      "a live process this user may not signal") pid=1 ;;
+      "a process that has exited")              pid="$(ct_fixture_process "already exited")" ;;
+      *) ct_die "ct_liveness_cases has a row nothing here knows how to build: '$what'" ;;
+    esac
+
+    actual=no
+    if ct_process_exists "$pid"; then actual=yes; fi
+    [ "$actual" = "$expects" ] || ct_die "'$what' (pid $pid) should$([ "$expects" = yes ] || printf ' NOT') be
+  reported as existing, and the predicate said $actual. Everything that decides
+  whether a service is running reads this one answer, and reporting a live
+  process as gone is what lets ct delete the record of a daemon that is still
+  holding its port."
+
+    if [ "$mine" = yes ]; then kill -KILL "$pid"; fi
+  done < <(ct_liveness_cases)
+
+  verify_pid_of
+
+  ct_ok "  a process is reported alive whether or not this user could signal it"
+}
+
+# ct_pid_of is the predicate's other consumer, and it reaches the same verdict by
+# its own route: a pidfile plus a liveness test, answering "is this service
+# running". It gets its own rows because the tables below cannot give it these
+# ones -- they drive ct_stop_service, which signals what it is handed, and the
+# borrowed pid in the middle row must never be signalled. Reading is all that
+# happens here.
+#
+# Fields: what the pidfile holds|does ct_pid_of report a running service|is the pid ours to kill
+ct_pid_of_cases() {
+  cat <<'EOF'
+the pid of a process this shell started|yes|yes
+the pid of a live process this user may not signal|yes|no
+the pid of a process that has exited|no|no
+nothing, because there is no pidfile|no|no
+EOF
+}
+
+# Makes one ct_pid_of_cases row true in $2 and prints the pid it wrote, or
+# nothing for the row that describes no pidfile at all.
+ct_pid_of_fixture() {
+  local holds="$1" run_dir="$2" pid
+  rm -f "$run_dir/fixture.pid"
+  case "$holds" in
+    "the pid of a process this shell started")
+      pid="$(ct_fixture_process "exits on TERM")" ;;
+    "the pid of a live process this user may not signal")
+      pid=1 ;;
+    "the pid of a process that has exited")
+      pid="$(ct_fixture_process "already exited")" ;;
+    "nothing, because there is no pidfile")
+      return 0 ;;
+    *) ct_die "ct_pid_of_cases has a row nothing here knows how to build: '$holds'" ;;
+  esac
+  printf '%s\n' "$pid" > "$run_dir/fixture.pid"
+  printf '%s\n' "$pid"
+}
+
+verify_pid_of() {
+  local holds expects mine run_dir pid actual
+
+  run_dir="$(mktemp -d)"
+  [ -d "$run_dir" ] || ct_die "mktemp -d produced no directory"
+
+  while IFS='|' read -r holds expects mine; do
+    pid="$(ct_pid_of_fixture "$holds" "$run_dir")"
+
+    actual=no
+    if [ -n "$(CT_RUN_DIR="$run_dir"; ct_pid_of fixture)" ]; then actual=yes; fi
+    [ "$actual" = "$expects" ] || ct_die "a pidfile holding '$holds' should$([ "$expects" = yes ] || printf ' NOT') make
+  ct_pid_of report a running service, and it said $actual. This is the answer
+  './ct status', './ct up' and './ct down' all start from: call a live service
+  stopped here and down deletes its record without signalling anything, while
+  up starts a second copy into the port the first one still holds."
+
+    if [ "$mine" = yes ]; then kill -KILL "$pid"; fi
+  done < <(ct_pid_of_cases)
+  rm -rf "$run_dir"
 }
 
 # One fixture process behaving the way a row says, its pid on stdout. Shared by
