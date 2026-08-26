@@ -264,9 +264,9 @@ ct_record_pid() {
   ct_signal_until_gone TERM "$pid" "$STOP_TIMEOUT_SECONDS" \
     || ct_signal_until_gone KILL "$pid" "$KILL_GRACE_SECONDS" \
     || ct_die "$name started as pid $pid, its pidfile could not be written to
-  $(ct_pidfile "$name"), and neither TERM nor KILL got rid of it -- whether they
-  were ignored or refused is in kill's own output above. It is running now and
-  nothing records it: find it with 'ps -p $pid' and stop it by hand."
+  $(ct_pidfile "$name"), and pid $pid is still there after TERM and KILL. If
+  either signal was refused, kill's own message is above this one. Nothing
+  records that process now: find it with 'ps -p $pid' and stop it by hand."
   ct_die "$name started as pid $pid but $(ct_pidfile "$name") could not be
   written -- killed it rather than leave a process nothing can see."
 }
@@ -435,9 +435,11 @@ ct_stop_service() {
     ct_signal_until_gone TERM "$pid" "$STOP_TIMEOUT_SECONDS" \
       || ct_die "$name (pid $pid) is still running.
   ct waited up to ${STOP_TIMEOUT_SECONDS}s after SIGTERM; if the signal itself
-  was refused, kill's own message is directly above this one. The pidfile is
+  was refused, kill's own message is directly above this one. Its pidfile is
   left in place, so './ct status' still sees it and './ct up' will not start a
-  second copy."
+  second copy of it.
+  This ends the run, so anything ct had not reached yet is still running too.
+  './ct status' is the one place that says which -- see claude-lifecycle-ts1."
     ct_ok "$name stopped"
   else
     ct_info "$name not running"

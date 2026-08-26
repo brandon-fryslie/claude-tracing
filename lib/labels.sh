@@ -13,13 +13,16 @@
 # A probe prints one fact about here, or nothing when the fact does not apply.
 # Nothing is a real answer, not a failure: claude runs in plenty of directories
 # that are not git checkouts. Git reports that on stderr and exits non-zero, so
-# discarding both is reading the answer we asked for rather than hiding a
-# failure: the exit status IS the fact being collected, and the message on
-# stderr only restates it. Stated as the pattern rather than by pointing at
-# another function that also follows it -- a comment in one file naming code in
-# another is a copy of a fact kept where it cannot see the fact change, and the
-# pointer that used to be here outlived the line it named.
-# [LAW:one-source-of-truth]
+# discarding both is reading the answer this probe asked for.
+#
+# Only for that one reason, though, and the gap is worth naming rather than
+# implying away: a non-zero exit meaning something else -- a checkout this user
+# may not read, a repository git calls dubiously owned -- arrives here as the
+# same silence, and the discarded stderr was the only thing that said which.
+# The run is then labelled as though it happened outside a checkout, which by
+# the paragraph above is a loss no later query can repair. Measured on
+# 2026-08-26: a real repo with an unreadable .git probes as no repo at all.
+# Open as claude-labels-92k. [LAW:no-silent-failure]
 
 ct_probe_repo_name() {
   local toplevel
