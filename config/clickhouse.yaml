@@ -199,41 +199,120 @@ startup_scripts:
         TTL toDateTime(Timestamp) + INTERVAL 1 YEAR
         SETTINGS ttl_only_drop_parts = 1
 
-    # The one thing that cannot be a column: attributing a subagent's tokens to
-    # the KIND of subagent, because agent_id and subagent_type land on different
-    # spans. The link is the span tree -- an llm_request hangs under the
-    # tool.execution of the Agent tool call that spawned it -- so it is a two-hop
-    # walk, and a walk stated once here rather than re-derived by every question
-    # that needs it. Re-derived, it would eventually be got wrong by one hop and
-    # return a number that looks entirely reasonable. [LAW:one-source-of-truth]
+    # --- prices ---------------------------------------------------------
+    # No span carries a cost. Claude Code emits dollars only on the metrics
+    # signal, at session grain and onto a Prometheus scrape surface that forgets
+    # a series after metric_expiration -- so there is no per-request cost to
+    # promote and no history to backfill from. Dollars are therefore DERIVED
+    # here, from token counts this table already holds back to its first row.
     #
-    # A plain view, so it costs no storage and cannot fall behind the table.
+    # That direction is the deliberate one, and not only because it is the one
+    # that works. Anthropic's counter is itself tokens multiplied by a rate
+    # table; capturing it would store someone else's arithmetic with the rate
+    # table thrown away -- unauditable, un-backfillable, and stuck at session
+    # grain, where it could never be split by `ServesToolCall` or `SubagentType`.
+    # Tokens are the territory and dollars are a map; this repo keeps the
+    # territory and redraws the map on every read. [FRAMING:representation]
     #
-    # OR REPLACE, unlike the table above, and the asymmetry is the point: a view
-    # holds no data, so restating it on every start costs nothing and keeps this
-    # file authoritative over what the server actually has. Under IF NOT EXISTS an
-    # edited definition would apply on a fresh checkout and be silently ignored on
-    # every machine that already ran once -- two definitions of one fact, and no
-    # way to tell which one answered your query. [LAW:one-source-of-truth]
+    # A VIEW rather than a table, for the reason the views below are: it holds
+    # no data, so this file stays authoritative over what the server has and a
+    # price edit applies on the next `./ct up` everywhere, instead of applying
+    # on a fresh checkout and being silently ignored on a machine that already
+    # ran. A seeded table would be a second copy of these numbers.
+    # [LAW:one-source-of-truth]
+    #
+    # EffectiveFrom is what keeps a price change from rewriting history. Prices
+    # move; a table holding only today's rate would silently re-price last March
+    # at this March's numbers and return something entirely plausible. So a rate
+    # is not a fact about a model, it is a fact about a model over an interval,
+    # and the join below is an ASOF join that asks for the rate in force at the
+    # timestamp of the request. Adding a price is appending a row.
+    # [LAW:types-are-the-program]
+    #
+    # THE DATE ON THESE ROWS IS THE DATE THEY WERE VERIFIED, not the date
+    # Anthropic set the price -- which this repo has no way to know. A span older
+    # than the earliest row here matches nothing and comes back `Priced = false`
+    # rather than costed at a rate nobody checked against it. Unpriced and loud
+    # beats plausible and wrong. [LAW:no-silent-failure]
+    #
+    # HOW THESE FOUR NUMBERS WERE ESTABLISHED, so the next person can redo it
+    # rather than trust it: Claude Code's own `claude_code_cost_usage_USD_total`
+    # counter is an independent computation of the same quantity, and it is
+    # labelled identically to `claude_code_token_usage_tokens_total` apart from a
+    # `type` label. Matching the two on every other label gives, per series, a
+    # dollar figure and the four token counts behind it -- and the rates fall
+    # out. Every observed series reproduced, to the limit of what the counter can
+    # express: it is serialised as a float64, so it reports 2.6423449999999997
+    # where the true figure is 2.642345, and the decimal computed here is the
+    # more exact of the two. The procedure, and the trap that the counter is a
+    # decaying window rather than a ledger, are in docs/analytics-findings.md.
+    #
+    # Model is matched exactly, suffix and all. `claude-opus-5[1m]` is a routing
+    # identifier rather than a price tier -- measured, it bills at plain Opus 5
+    # rates with no long-context premium -- but the next suffix might not, so an
+    # unknown one must miss this table loudly instead of being normalised onto a
+    # rate that was never checked against it. That exactness is why one model can
+    # need two rows: the bare `claude-opus-5` row is the same measurement as the
+    # `[1m]` row above it, written out again because an exact match cannot infer
+    # one string from the other. `claude-haiku-4-5-20251001` was measured on
+    # input and output only -- no Haiku request in this store has ever touched
+    # the cache, so its two cache rates are the published multipliers carried
+    # over from Opus and are the first thing to re-check if a Haiku figure ever
+    # looks wrong.
+    #
+    # Cache creation is the one rate that is not a list price: it is the base
+    # input rate times a multiplier set by the cache TTL the request asked for,
+    # 2x at one hour and 1.25x at five minutes. No span records which TTL was
+    # used, so this column cannot be derived per request -- it is a claim about
+    # how the client is configured. The measured multiplier is 2x, Claude Code's
+    # one-hour TTL, and re-running the procedure above is what catches it
+    # changing.
+    # The rates are written per MILLION tokens, the unit every price list quotes,
+    # and the view also exposes each one per single token. That second set is not
+    # a convenience: it is where the scale is chosen, and choosing it in the
+    # wrong place silently truncates money.
+    #
+    # A rate carries 6 decimal places, so a rate divided by a million needs 12 to
+    # stay exact. ClickHouse gives a decimal division the scale of its left
+    # operand, which makes the order of operations load-bearing. Multiplying
+    # first and dividing after -- `tokens * ratePerMTok / 1000000` -- divides a
+    # scale-6 product and truncates the answer back to 6 places: a real
+    # 0.2605975 stores as 0.260597, and one Haiku cache-read token, at
+    # $0.0000001, stores as zero. Truncation, not rounding, so every request
+    # under-reports and a month's total drifts one way only. Dividing the rate
+    # first, at scale 12, keeps both exact.
+    #
+    # Decimal(18,12) tops out near $1,000,000, which no single request
+    # approaches, and `sum()` promotes to Decimal(38,12), so totals have room
+    # regardless. [LAW:one-source-of-truth] the conversion is stated once here
+    # rather than at each of the four multiplications downstream, which is also
+    # what keeps those four readable as plain tokens-times-rate.
     - query: |
-        CREATE OR REPLACE VIEW claude.subagent_requests AS
+        CREATE OR REPLACE VIEW claude.model_prices AS
         SELECT
-          request.Timestamp           AS Timestamp,
-          request.SessionId           AS SessionId,
-          request.AgentId             AS AgentId,
-          agent_tool.SubagentType     AS SubagentType,
-          request.Model               AS Model,
-          request.InputTokens         AS InputTokens,
-          request.OutputTokens        AS OutputTokens,
-          request.CacheReadTokens     AS CacheReadTokens,
-          request.CacheCreationTokens AS CacheCreationTokens,
-          request.ContextTokens       AS ContextTokens,
-          request.Repository          AS Repository,
-          request.Branch              AS Branch
-        FROM claude.spans AS request
-        JOIN claude.spans AS execution  ON request.ParentSpanId   = execution.SpanId
-        JOIN claude.spans AS agent_tool ON execution.ParentSpanId = agent_tool.SpanId
-        WHERE request.SpanType = 'llm_request' AND request.RequestContext = 'tool'
+          Model,
+          EffectiveFrom,
+          InputUSDPerMTok,
+          CacheReadUSDPerMTok,
+          CacheCreationUSDPerMTok,
+          OutputUSDPerMTok,
+          toDecimal64(InputUSDPerMTok, 12)         / 1000000 AS InputUSDPerToken,
+          toDecimal64(CacheReadUSDPerMTok, 12)     / 1000000 AS CacheReadUSDPerToken,
+          toDecimal64(CacheCreationUSDPerMTok, 12) / 1000000 AS CacheCreationUSDPerToken,
+          toDecimal64(OutputUSDPerMTok, 12)        / 1000000 AS OutputUSDPerToken
+        FROM values(
+          'Model String,
+           EffectiveFrom Date,
+           InputUSDPerMTok Decimal64(6),
+           CacheReadUSDPerMTok Decimal64(6),
+           CacheCreationUSDPerMTok Decimal64(6),
+           OutputUSDPerMTok Decimal64(6)',
+
+          -- Model                       EffectiveFrom          Input  CacheRead  CacheCreation  Output
+          ('claude-opus-5[1m]',          toDate('2026-08-23'),    5.0,       0.5,          10.0,   25.0),
+          ('claude-opus-5',              toDate('2026-08-23'),    5.0,       0.5,          10.0,   25.0),
+          ('claude-haiku-4-5-20251001',  toDate('2026-08-23'),    1.0,       0.1,           2.0,    5.0)
+        )
 
     # The other thing the flat table cannot express: what a request had to do with
     # a tool call. Tokens are on llm_request spans, tools are on tool spans, and
@@ -287,15 +366,58 @@ startup_scripts:
     # CarriesToolResult is false and ToolResultTokens is 0, by construction
     # rather than by a filter every query would have to remember.
     # [LAW:types-are-the-program]
+    #
+    # DOLLARS, and the one way to get them wrong. The four token counts bill at
+    # rates that differ by a factor of fifty, and the mix is extreme -- 18.4M
+    # cache-read tokens against 246 fresh input tokens on one day's sessions --
+    # so any single blended rate applied to `TotalTokens` is wrong by a large
+    # factor while looking entirely reasonable. Each count is therefore
+    # multiplied by its own rate and the four results summed. `CostUSD` is that
+    # sum, stated once here so no two queries can disagree about it, and the four
+    # components stay visible beside it because "cache reads or output?" is the
+    # question that follows "how much?". [LAW:one-source-of-truth]
+    #
+    # ASOF LEFT JOIN picks the price row in force at the request's own timestamp,
+    # which is what makes a future price change leave last month's answer alone.
+    # It matches at most one row per request, so the join cannot fan out and the
+    # window below still sees exactly one row per request.
+    #
+    # `toDate(..., 'UTC')` is pinned rather than left to the server. Timestamp is
+    # DateTime64(9) with no timezone attached, so a bare toDate() resolves it in
+    # whatever zone the host happens to be set to, and the same nanosecond then
+    # lands on different calendar days on different machines: the instant
+    # 2026-08-23 03:00:00 UTC is 2026-08-23 in UTC and Tokyo, and 2026-08-22 in
+    # America/Denver. Either side of an EffectiveFrom boundary, that decides
+    # whether a request is priced at all -- so unpinned, one span's cost would
+    # depend on the laptop reading it. EffectiveFrom records the date a rate was
+    # verified, which is an absolute fact, so the boundary is compared in
+    # absolute time. Only the join is pinned: toYYYYMM() in a reader's own query
+    # stays local, because a reader asking for "last month" means their own.
+    #
+    # LEFT, and that is the hazard: an unmatched model does not drop the row, it
+    # fills the rates with zeros, and zero dollars is shaped exactly like a
+    # request that was free. `Priced` is the discriminator that pulls those two
+    # apart -- a real price row always has a non-empty Model, an unmatched one
+    # reads '' -- and `ct verify` fails on any request in its probe session that
+    # comes back unpriced. Without that column a newly-renamed model would cost
+    # nothing, forever, and the monthly total would just quietly shrink.
+    # [LAW:parse-dont-validate]
+    #
+    # Decimal rather than Float64 because this is money, and decimal addition
+    # over a year of requests does not drift the way repeated binary-float
+    # addition does. The four multiplications below read as plain
+    # tokens-times-rate because the per-token rates they use already carry the
+    # scale that keeps them exact; the reasoning behind that scale, and the
+    # truncation it exists to prevent, is with the prices in model_prices above.
     - query: |
         CREATE OR REPLACE VIEW claude.llm_requests AS
         SELECT
-          Timestamp,
+          request.Timestamp AS Timestamp,
           SessionId,
           SpanId,
           ParentSpanId,
           Duration,
-          Model,
+          request.Model AS Model,
           RequestContext,
           -- Carried through rather than consumed: it is what EndedInToolCall is
           -- derived from, so keeping it here lets a reader check that derivation
@@ -314,8 +436,21 @@ startup_scripts:
 
           -- Everything read plus everything written. A token count and not a
           -- cost: cache reads, fresh input and output are billed at different
-          -- rates, and dollars arrive with their own column later.
+          -- rates. `CostUSD` below is the money answer; do not multiply this by
+          -- a price.
           ContextTokens + OutputTokens AS TotalTokens,
+
+          -- Whether a rate was found at all. False means this model is missing
+          -- from claude.model_prices and the four figures below are zeros that
+          -- mean "unknown", not "free".
+          CAST(price.Model != '' AS Bool) AS Priced,
+
+          toDecimal64(InputTokens, 0)         * price.InputUSDPerToken         AS InputCostUSD,
+          toDecimal64(CacheReadTokens, 0)     * price.CacheReadUSDPerToken     AS CacheReadCostUSD,
+          toDecimal64(CacheCreationTokens, 0) * price.CacheCreationUSDPerToken AS CacheCreationCostUSD,
+          toDecimal64(OutputTokens, 0)        * price.OutputUSDPerToken        AS OutputCostUSD,
+          InputCostUSD + CacheReadCostUSD
+            + CacheCreationCostUSD + OutputCostUSD AS CostUSD,
 
           -- CAST to Bool because comparing a LowCardinality(String) yields a
           -- LowCardinality(UInt8), which ClickHouse refuses to store as a column.
@@ -331,8 +466,81 @@ startup_scripts:
              ContextTokens - lagInFrame(ContextTokens) OVER w
                            - lagInFrame(OutputTokens) OVER w,
              0) AS ToolResultTokens
-        FROM claude.spans
+        FROM claude.spans AS request
+        ASOF LEFT JOIN claude.model_prices AS price
+          ON request.Model = price.Model
+         AND price.EffectiveFrom <= toDate(request.Timestamp, 'UTC')
         WHERE SpanType = 'llm_request'
         WINDOW w AS (PARTITION BY SessionId, if(ParentSpanId = '', SpanId, ParentSpanId)
                      ORDER BY Timestamp, SpanId
                      ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+
+    # The one thing that cannot be a column: attributing a subagent's tokens to
+    # the KIND of subagent, because agent_id and subagent_type land on different
+    # spans. The link is the span tree -- an llm_request hangs under the
+    # tool.execution of the Agent tool call that spawned it -- so it is a two-hop
+    # walk, and a walk stated once here rather than re-derived by every question
+    # that needs it. Re-derived, it would eventually be got wrong by one hop and
+    # return a number that looks entirely reasonable. [LAW:one-source-of-truth]
+    #
+    # A plain view, so it costs no storage and cannot fall behind the table.
+    #
+    # OR REPLACE, unlike the table above, and the asymmetry is the point: a view
+    # holds no data, so restating it on every start costs nothing and keeps this
+    # file authoritative over what the server actually has. Under IF NOT EXISTS an
+    # edited definition would apply on a fresh checkout and be silently ignored on
+    # every machine that already ran once -- two definitions of one fact, and no
+    # way to tell which one answered your query. [LAW:one-source-of-truth]
+    #
+    # It walks up from claude.llm_requests rather than from the raw span table,
+    # and that is what keeps dollars a single definition. This view needs the same
+    # per-request cost the view above computes; reaching for `claude.spans` here
+    # would mean joining the price table a second time and writing the four
+    # multiplications out again, two copies to keep in step forever. Selecting the
+    # priced view instead means the money arithmetic exists in exactly one place
+    # and a subagent's cost is whatever its requests already cost.
+    # [LAW:one-source-of-truth]
+    #
+    # It is not cheaper to run, and the columns it selects are the whole of what
+    # it offers. A plain view is expanded at query time rather than materialised,
+    # so this reads claude.spans three times exactly as the direct join did --
+    # once inside llm_requests, once per hop -- with the ASOF join added on top.
+    # The reason to select from the view is that the arithmetic is written once,
+    # which is a correctness argument and does not need a performance one.
+    # `ServesToolCall` is deliberately not carried through: it is true for every
+    # row here by construction, since `RequestContext = 'tool'` is one of its
+    # three clauses and this view filters on precisely that, so exposing it would
+    # be a column that answers the same way forever.
+    #
+    # Ordering here is load-bearing, which is why this block sits last: a view is
+    # validated against its sources when it is created, so llm_requests must
+    # already exist when this runs, and llm_requests in turn needs model_prices.
+    # On a fresh machine these three run in file order, and a reordering that
+    # breaks the chain fails loudly at startup under throw_on_error rather than
+    # leaving a half-built schema. [LAW:no-ambient-temporal-coupling]
+    - query: |
+        CREATE OR REPLACE VIEW claude.subagent_requests AS
+        SELECT
+          request.Timestamp             AS Timestamp,
+          request.SessionId             AS SessionId,
+          request.AgentId               AS AgentId,
+          agent_tool.SubagentType       AS SubagentType,
+          request.Model                 AS Model,
+          request.InputTokens           AS InputTokens,
+          request.OutputTokens          AS OutputTokens,
+          request.CacheReadTokens       AS CacheReadTokens,
+          request.CacheCreationTokens   AS CacheCreationTokens,
+          request.ContextTokens         AS ContextTokens,
+          request.TotalTokens           AS TotalTokens,
+          request.Priced                AS Priced,
+          request.InputCostUSD          AS InputCostUSD,
+          request.CacheReadCostUSD      AS CacheReadCostUSD,
+          request.CacheCreationCostUSD  AS CacheCreationCostUSD,
+          request.OutputCostUSD         AS OutputCostUSD,
+          request.CostUSD               AS CostUSD,
+          request.Repository            AS Repository,
+          request.Branch                AS Branch
+        FROM claude.llm_requests AS request
+        JOIN claude.spans AS execution  ON request.ParentSpanId   = execution.SpanId
+        JOIN claude.spans AS agent_tool ON execution.ParentSpanId = agent_tool.SpanId
+        WHERE request.RequestContext = 'tool'
