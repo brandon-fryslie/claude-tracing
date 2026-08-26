@@ -34,7 +34,12 @@ CT_CLICKHOUSE_NATIVE_PORT=9000  # clickhouse <- collector (native protocol)
 # The complete set of resource service.names whose telemetry belongs in the
 # sinks. Two subjects, and the list is closed: everything else arriving at the
 # collector is this stack talking about itself, and collector.yaml's filter
-# drops it. A third subject costs one constant here and one clause there.
+# drops it.
+#
+# A third subject costs one constant here and one clause in the anchored OTTL
+# condition there -- one clause and not three, because that condition is written
+# once and aliased into the metrics and logs pipelines. Adding a subject to
+# traces alone is not a mistake this pair can make.
 #
 # Naming them here rather than in `ct` is what makes that filter possible at
 # all -- config/*.yaml can only read this file, via ${env:...}, so an allowlist

@@ -37,19 +37,22 @@ launched with, a ClickHouse row whose promoted columns are populated rather than
 present, the tokens that session spent being attributable to the tool call it made, and
 every one of its requests carrying a price so the session has a cost in dollars.
 
-The last stage asks the opposite question of the other three: not whether your data
-arrived, but whether anything else did. It counts the spans in the store from a service
-that is neither Claude Code nor verify's own probe, before the run and after, and fails if
-the number moved. Jaeger self-traces its own query API — which verify polls dozens of
-times per run — so without something stopping it the stack quietly files about a hundred
-spans about itself per verify, and "how big is my history" answers wrong for a year. The
-collector drops them on the way in; this stage is what would notice if it stopped.
-
-One further check runs only if it applies: where a [`lit`](#how-many-turns-a-ticket-took-and-what-it-cost)
+Still inside that third stage, one further check runs only if it applies: where a
+[`lit`](#how-many-turns-a-ticket-took-and-what-it-cost)
 workspace answers, verify confirms its history still parses and its actors are still
 session ids spans can be joined on. With no `lit`, no tickets in it, or no ticket a Claude
 session has moved — including a checkout nobody ran `lit init` in — it says so and carries
 on: the telemetry path does not depend on an issue tracker this stack doesn't install.
+
+The fourth stage asks the opposite question of the first three: not whether your data
+arrived, but whether anything else did. It marks the time before the run starts, then
+counts the rows written since — in both the span store and the event store — from a
+service that is neither Claude Code nor verify's own probe, and fails if it finds any.
+Jaeger self-traces its own query API, which verify polls dozens of times per run, so
+without something stopping it the stack quietly files about a hundred spans about itself
+per verify and "how big is my history" answers wrong for a year. The collector drops them
+on the way in; this stage is what would notice if it stopped. Spans that were already
+there before the run began are history rather than a fault, and it does not judge them.
 
 Two kinds of lit trouble do fail the run, and they split on whether lit produced an export
 at all. A workspace that *has* a store and still can't be exported from is one, because

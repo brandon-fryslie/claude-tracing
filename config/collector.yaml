@@ -49,17 +49,24 @@ processors:
   # propagate additionally buys is that an OTTL statement this file gets WRONG
   # in some future edit fails loudly at the processor instead of quietly
   # deciding every span's fate.
+  # The condition is written once and aliased into the other two signals. Three
+  # verbatim copies would be one rule with three rulebooks, and the way that
+  # fails is specific: a third subject gets added to traces, metrics and logs
+  # keep dropping it, and the store looks right while the scrape and the event
+  # table go quiet. A YAML anchor makes that divergence unrepresentable rather
+  # than merely discouraged -- there is no second copy to forget.
+  # [LAW:one-source-of-truth]
   filter/only_our_subjects:
     error_mode: propagate
     traces:
       span:
-        - resource.attributes["service.name"] != "${env:CT_CLAUDE_SERVICE_NAME}" and resource.attributes["service.name"] != "${env:CT_SELFTEST_SERVICE}"
+        - &only_our_subjects resource.attributes["service.name"] != "${env:CT_CLAUDE_SERVICE_NAME}" and resource.attributes["service.name"] != "${env:CT_SELFTEST_SERVICE}"
     metrics:
       datapoint:
-        - resource.attributes["service.name"] != "${env:CT_CLAUDE_SERVICE_NAME}" and resource.attributes["service.name"] != "${env:CT_SELFTEST_SERVICE}"
+        - *only_our_subjects
     logs:
       log_record:
-        - resource.attributes["service.name"] != "${env:CT_CLAUDE_SERVICE_NAME}" and resource.attributes["service.name"] != "${env:CT_SELFTEST_SERVICE}"
+        - *only_our_subjects
 
   # Small timeout: this is an interactive dev loop, so a span should be visible
   # in the UI a couple of seconds after the tool call finishes, not a minute.

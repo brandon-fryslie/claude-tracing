@@ -492,9 +492,10 @@ cmd_claude() {
 # --- verification -----------------------------------------------------------
 # [LAW:verifiable-goals] "the stack is up" is not the goal; "this run's telemetry
 # is queryable in every sink the stack claims to have, and you can tell what work
-# it was doing" is. All three stages run every time, cheapest first, each
+# it was doing" is. All four stages run every time, cheapest first, each
 # isolating one thing: the label encoding, then the transport, then the thing you
-# actually came for.
+# actually came for -- and last, the mirror image of the other three, which ask
+# whether your data arrived. Stage 4 asks whether anything else did.
 #
 # A sink outside this definition of done has nothing holding it up, so it rots
 # and nobody is told -- which is how the metrics endpoint answered HTTP 200 with
@@ -1139,84 +1140,117 @@ verify_claude() {
   esac
 }
 
-# Rows in the span store whose ServiceName is not one of this stack's subjects
-# -- which is to say, rows that should not exist at all.
+# ClickHouse's clock, not the shell's, so the window this run is judged over and
+# the timestamps it is judged against come from one source. Both processes are
+# on this machine and their clocks agree today; asking twice is how that stops
+# being true. [LAW:one-source-of-truth]
+ct_clickhouse_now() {
+  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "SELECT now() FORMAT TSV"
+}
+
+# Rows written since $1 whose ServiceName is not one of this stack's subjects --
+# which is to say, rows that should not exist at all.
+#
+# Both durable stores, summed to one scalar. The events table carries the same
+# ServiceName column and is fed by the same filter, so counting spans alone
+# would be a check whose name is wider than its query -- the logs pipeline could
+# leak for a year while this reported clean. One UNION ALL rather than two
+# assertions because there is nothing per-store to say: the answer is a single
+# "how many rows exist that should not". [LAW:one-type-per-behavior]
+#
+# The Prometheus scrape is deliberately NOT here despite the same filter
+# covering it. It is a surface with a metric_expiration, so it forgets: an
+# assertion over it would read empty and pass on most runs whether or not the
+# metrics clause still worked, and a check that cannot fail advertises coverage
+# it does not have. What would have made a metrics-only regression possible --
+# three hand-synced copies of the OTTL condition -- is closed at the root
+# instead, by the YAML anchor in config/collector.yaml. [LAW:verifiable-goals]
+#
+# Scoped by time rather than by a before/after delta over the whole table. That
+# is what keeps two concurrent `./ct verify` runs from being judged against each
+# other's global counter, and it makes pollution that predates the filter
+# irrelevant by construction instead of by subtraction.
 #
 # The two names come from lib/common.sh, the same pair collector.yaml's
 # filter/only_our_subjects allows, so neither side can be renamed alone. The set
 # MEMBERSHIP is stated in both places, and that is what makes a divergence loud
 # rather than silent: narrow the filter and stage 2 dies with a sink that never
 # received the selftest run; widen it past this list and stage 4 below dies with
-# the new name in its hand. [LAW:one-source-of-truth]
+# the new name in its hand.
 #
 # The SQL is its own function so that the call which DECIDES and the call which
 # EXPLAINS a failure send the same bytes -- ct_clickhouse_error re-asks without
 # -f to buy back the server's own message, and re-asking a different question
-# would answer about a query that never failed. [LAW:one-source-of-truth]
-ct_foreign_span_query() {
-  printf '%s' "SELECT count()
-                 FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
-                WHERE ServiceName NOT IN ('$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE')
-                FORMAT TSV"
+# would answer about a query that never failed.
+ct_foreign_row_query() {
+  local since="$1" mine="'$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE'"
+  printf '%s' "SELECT sum(n) FROM (
+                 SELECT count() AS n FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE
+                  WHERE Timestamp >= toDateTime('$since') AND ServiceName NOT IN ($mine)
+                  UNION ALL
+                 SELECT count() AS n FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_EVENTS_TABLE
+                  WHERE Timestamp >= toDateTime('$since') AND ServiceName NOT IN ($mine))
+               FORMAT TSV"
 }
 
-ct_foreign_span_count() {
-  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_span_query)"
+ct_foreign_row_count() {
+  ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_row_query "$1")"
 }
 
 # [LAW:verifiable-goals] Asserts the rule where it can actually be observed. That
 # the filter is CONFIGURED is not the property -- a processor can be dropped from
 # a pipeline, an OTTL condition can be edited into something that matches
 # nothing, and the config still loads. The property is that a whole verify run
-# leaves the store with no more foreign rows than it found.
+# wrote nothing into either store that no subject of this stack emitted.
 #
-# A delta and not an absolute count of zero: a store that accumulated jaeger
-# spans before this filter existed is history, not a fault, and asserting zero
-# would fail every install that ever ran the old code while offering it no way
-# forward. What this code is answerable for is what it ADDS.
-#
-# Nothing here sleeps waiting for a leak to settle, and nothing needs to: the
-# Jaeger query API polls that provoke the self-traces happen in stage 2, and an
-# entire real Claude session runs between them and this count. A filter that
-# regressed would have had all of stage 3 to deliver the evidence.
-# [LAW:no-ambient-temporal-coupling]
+# What this catches is a filter that has stopped filtering, and it is worth
+# being exact about why that does not need a sleep. Stage 3 provokes self-traces
+# too -- jaeger_has_run and claude_labels_searchable both poll the Jaeger query
+# API late in the stage -- so the spans from the LAST such poll may still be
+# inside jaeger's own 5s batch window when this count runs, and this check does
+# not claim them. It does not need them: stage 2's polls fired a whole Claude
+# session ago, and a filter that regressed produced evidence then. A leak large
+# enough to matter cannot hide in the tail of one batch window.
+# [LAW:no-ambient-temporal-coupling] the check states the window it is
+# answerable for rather than betting on a delay that makes it look wider.
 verify_no_stack_telemetry() {
-  local before="$1" after
-  ct_info "stage 4/4: the stack recorded nothing of itself"
+  local since="$1" found
+  ct_info "stage 4/4: no foreign rows in the span or event store"
 
-  after="$(ct_foreign_span_count)" \
-    || ct_die "could not count foreign spans in $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE.
-  The same count answered before stage 1, so this is ClickHouse going away
+  found="$(ct_foreign_row_count "$since")" \
+    || ct_die "could not count foreign rows written since $since.
+  The same query answered before stage 1, so this is ClickHouse going away
   mid-run rather than a query that was never going to work.
-  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_span_query)")"
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_row_query "$since")")"
 
-  [ "$after" -le "$before" ] || ct_die "this run stored $((after - before)) spans that no subject of this stack emitted.
+  [ "$found" -eq 0 ] || ct_die "this run stored $found rows that no subject of this stack emitted.
   Something now reaches a sink without crossing filter/only_our_subjects in
   config/collector.yaml, or that filter no longer says what it used to. Jaeger
   self-traces its own query API and is the usual author; the collector and
   ClickHouse can acquire self-telemetry in any release.
-  Who it was:
-    ./ct sql \"SELECT ServiceName, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE ServiceName NOT IN ('$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE') GROUP BY 1 FORMAT PrettyCompact\"
+  Who it was, in the store that holds spans:
+    ./ct sql \"SELECT ServiceName, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE WHERE Timestamp >= toDateTime('$since') AND ServiceName NOT IN ('$CT_CLAUDE_SERVICE_NAME', '$CT_SELFTEST_SERVICE') GROUP BY 1 FORMAT PrettyCompact\"
+  And in the one that holds events -- the same query against $CT_CLICKHOUSE_EVENTS_TABLE.
   Whether the filter still sees them at all -- incoming should exceed outgoing:
     curl -s http://127.0.0.1:$CT_COLLECTOR_TELEMETRY_PORT/metrics | grep only_our_subjects"
 
-  ct_ok "  no span from this stack's own daemons reached the store"
+  ct_ok "  nothing this stack's own daemons emitted reached either store"
 }
 
 cmd_verify() {
-  local foreign_before
+  local run_start
 
-  # Taken before stage 1, because stage 2 polls Jaeger's query API and that poll
+  # Marked before stage 1, because stage 2 polls Jaeger's query API and that poll
   # is itself what provokes the leak this run must not commit.
-  foreign_before="$(ct_foreign_span_count)" \
-    || ct_die "$CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE would not answer a count -- is the stack up?
+  run_start="$(ct_clickhouse_now)" \
+    || ct_die "ClickHouse would not answer for the time -- is the stack up?
     ./ct status
-  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$(ct_foreign_span_query)")"
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_TIMEOUT_SECONDS" 'SELECT now() FORMAT TSV')"
 
   verify_labels
   verify_transport
   verify_claude
-  verify_no_stack_telemetry "$foreign_before"
+  verify_no_stack_telemetry "$run_start"
 
   echo
   ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CT_CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
