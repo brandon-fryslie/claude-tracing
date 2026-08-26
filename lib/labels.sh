@@ -13,8 +13,18 @@
 # A probe prints one fact about here, or nothing when the fact does not apply.
 # Nothing is a real answer, not a failure: claude runs in plenty of directories
 # that are not git checkouts. Git reports that on stderr and exits non-zero, so
-# discarding both is reading the answer we asked for -- the same move ct_pid_of
-# makes with kill -0 -- rather than a failure being hidden.
+# discarding both is reading the answer this probe asked for.
+#
+# Only for that one reason, though, and the gap is worth naming rather than
+# implying away: a non-zero exit meaning something else -- a checkout this user
+# may not read, a repository git calls dubiously owned -- arrives here as the
+# same silence, and the discarded stderr was the only thing that said which.
+# The run is then labelled as though it happened outside a checkout, and an
+# attribute that was never emitted cannot be backfilled -- so the loss is
+# silent, permanent, and indistinguishable at query time from a session that
+# genuinely had no repo. Measured on 2026-08-26: a real repo with an unreadable
+# .git probes as no repo at all. Open as claude-labels-92k.
+# [LAW:no-silent-failure]
 
 ct_probe_repo_name() {
   local toplevel

@@ -331,6 +331,27 @@ ct_poll_until() {
   return 1
 }
 
+# Does a process with this pid exist? The one answer to that question in this
+# codebase; everything that decides whether a service is running, stopped, or
+# still refusing to stop reads it from here. [LAW:single-enforcer]
+#
+# `ps -p` rather than `kill -0`, because they answer different questions and
+# only one of them is the question. `kill -0` asks "may I signal this", which
+# has three outcomes -- signalable, refused, absent -- and a shell can only see
+# two of them, so a refused signal is indistinguishable from a missing process
+# and the pid gets reported as gone. Measured on 2026-08-26: as a non-root user,
+# `kill -0 1` fails while launchd is plainly alive, so a kill-based predicate
+# answers "yes, gone" about pid 1. `ps -p` asks whether the process exists,
+# which is ownership-independent, so the third outcome stops existing rather
+# than being mapped onto the dangerous one.
+#
+# That mapping is dangerous in one specific direction, which is why the
+# distinction is worth a fork per call: every caller here treats "gone" as
+# permission to forget the process -- to delete its record, to report it
+# stopped, to stop escalating. A false "alive" costs a wait; a false "gone" is
+# the ghost this whole file is built to prevent. [FRAMING:representation]
+ct_process_exists() { ps -p "$1" >/dev/null 2>&1; }
+
 # Reports the live pid of a service, or nothing. A pidfile whose process is gone
 # is stale, not running -- callers get absence, never a dead pid.
 ct_pid_of() {
@@ -338,8 +359,6 @@ ct_pid_of() {
   pidfile="$(ct_pidfile "$1")"
   [ -f "$pidfile" ] || return 0
   pid="$(cat "$pidfile")" || return 0
-  # kill -0's stderr is the answer we are computing ("no such process"), not a
-  # failure being suppressed -- so discarding it is reading, not silencing.
-  if kill -0 "$pid" 2>/dev/null; then printf '%s\n' "$pid"; fi
+  if ct_process_exists "$pid"; then printf '%s\n' "$pid"; fi
   return 0
 }
