@@ -42,8 +42,48 @@ ct_probe() { curl -fs --max-time 2 -o /dev/null "$1"; }
 
 ct_clickhouse_url() { printf 'http://127.0.0.1:%s/' "$CT_CLICKHOUSE_HTTP_PORT"; }
 
-# Dies unless every ${env:VAR} a config file references is set and non-empty in
-# this process's environment.
+# The environment variables a config file reads, one per line, whichever way it
+# spells the reference. Two spellings because two upstreams chose differently:
+# OpenTelemetry's `${env:NAME}` in collector.yaml and jaeger.yaml, ClickHouse's
+# `"@from_env": NAME` in clickhouse.yaml. Which one a file uses is a property of
+# whose config format it is, so it lives here as data rather than as a caller
+# that knows which service it is looking at. [LAW:one-type-per-behavior]
+#
+# A pattern that matched only one spelling would not fail -- it would find
+# nothing and report a clean config, which is the exact failure the guard below
+# exists to prevent, one level up. It did: until 2026-08-26 this matched only
+# the OTel form, so clickhouse.yaml's four variables were never checked while
+# the comment claimed every config was.
+ct_config_env_refs() {
+  grep -oE '\$\{env:[A-Za-z_][A-Za-z0-9_]*\}|"@from_env": *[A-Za-z_][A-Za-z0-9_]*' "$1" \
+    | sed -E 's/^\$\{env:(.*)\}$/\1/; s/^"@from_env": *//' \
+    | sort -u
+}
+
+# True when a variable will reach a child process with a value -- which is to
+# say, exported and non-empty.
+#
+# Not `[ -n "${!var:-}" ]`, and the difference is the whole point. Indirect
+# expansion reads this shell's variable table and cannot see the export bit, so
+# a variable assigned in lib/common.sh but left off its `export` line answers
+# "present" here and arrives empty at the daemon two lines later -- the precise
+# scenario the die message below names as the usual cause. Measured: a
+# non-exported value reads back through `${!v}` and comes out empty in a child.
+#
+# `declare -p` prints `declare -x NAME=...` only for an exported variable and
+# fails for one that does not exist. Its failure is the answer, not an error to
+# report, which is why it is branched on rather than surfaced.
+ct_var_reaches_children() {
+  local decl
+  decl="$(declare -p "$1" 2>/dev/null)" || return 1
+  case "$decl" in
+    "declare -x"*) [ -n "${!1}" ] ;;
+    *)             return 1 ;;
+  esac
+}
+
+# Dies unless every environment variable a config file reads will reach the
+# process about to be started with it.
 #
 # [LAW:no-silent-failure] The collector does not need these to start. Handed an
 # unset variable it substitutes the empty string, logs one `warn` into a file
@@ -63,16 +103,17 @@ ct_assert_config_env() {
   local -a missing=()
 
   while read -r var; do
-    [ -n "${!var:-}" ] || missing+=("$var")
-  done < <(grep -oE '\$\{env:[A-Za-z_][A-Za-z0-9_]*\}' "$config" \
-             | sed 's/^\${env://; s/}$//' | sort -u)
+    ct_var_reaches_children "$var" || missing+=("$var")
+  done < <(ct_config_env_refs "$config")
 
-  [ "${#missing[@]}" -eq 0 ] || ct_die "$config reads ${#missing[@]} environment variable(s) this shell does not set:
+  [ "${#missing[@]}" -eq 0 ] || ct_die "$config reads ${#missing[@]} environment variable(s) that will not reach $service:
     ${missing[*]}
   $service would start anyway, substituting the empty string, and answer its
   readiness probe while behaving as something other than what the config says.
-  These come from lib/common.sh -- an assignment there that lost its export is
-  the usual cause. Compare:
+  These come from lib/common.sh, and note that assigning one is not enough --
+  a name missing from that file's \`export\` lines is set in your shell and
+  absent from every process it launches, which is the usual cause. Compare
+  both the assignment and the export:
     grep -n '${missing[0]}' lib/common.sh"
 }
 
