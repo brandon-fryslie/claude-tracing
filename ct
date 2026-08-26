@@ -26,6 +26,10 @@ STOP_TIMEOUT_SECONDS=30
 # How long a span may take to cross the collector's batch window and land in a
 # sink. Claude exports every 5s and the collector batches for 2 more.
 SINK_TIMEOUT_SECONDS=30
+# How long a worker that has been asked to stop gets before it is made to.
+# Long enough for an ordinary cleanup handler, short enough that a bound of N
+# seconds still means roughly N seconds.
+KILL_GRACE_SECONDS=5
 SELFTEST_SERVICE=claude-tracing-selftest
 
 # Claude Code's own resource service.name. cmd_env deliberately does not set
@@ -42,10 +46,33 @@ CLAUDE_SERVICE_NAME=claude-code
 # out. Hence -fs (quiet on failure) rather than -fsS.
 ct_probe() { curl -fs --max-time 2 -o /dev/null "$1"; }
 
+ct_clickhouse_url() { printf 'http://127.0.0.1:%s/' "$CT_CLICKHOUSE_HTTP_PORT"; }
+
 # One query, posted rather than URL-encoded, so a query containing anything at
 # all -- quotes, newlines, percent signs -- reaches ClickHouse as written.
+#
+# The bound comes from the caller because it is a property of the query: a plain
+# span query gets CT_CLICKHOUSE_TIMEOUT_SECONDS, and only a query that reaches
+# lit through executable() is entitled to lit's patience on top of it. Sharing
+# one constant made the pricing check and the readiness polls wait three times
+# their own documented budget for a tracker they never touch.
 ct_clickhouse() {
-  curl -fsS --max-time 30 "http://127.0.0.1:$CT_CLICKHOUSE_HTTP_PORT/" --data-binary "$1"
+  curl -fsS --max-time "$1" "$(ct_clickhouse_url)" --data-binary "$2"
+}
+
+# The same POST without -f, so a non-2xx yields ClickHouse's own error text
+# rather than curl's one-line summary of it. -f is what makes ct_clickhouse
+# report failure as a failed command, and it costs the body in exchange; this
+# buys the body back for the message, at the price of asking twice.
+#
+# For explaining a failure ct_clickhouse has ALREADY detected, and never for
+# deciding anything: without -f a server error comes back as an ordinary body,
+# so a caller that used this to test something would read the error as its
+# answer. [LAW:parse-dont-validate] the deciding path is the one that can fail.
+# Same bound as the call being explained, passed the same way, so the retry can
+# never have a shorter fuse than the attempt that detected the failure.
+ct_clickhouse_error() {
+  curl -sS --max-time "$1" "$(ct_clickhouse_url)" --data-binary "$2" 2>&1
 }
 
 # Blocks until the service answers its readiness URL, or dies with the tail of
@@ -89,6 +116,96 @@ ct_start_service() {
 
 ct_process_gone() { ! kill -0 "$1" 2>/dev/null; }
 
+# Run a command with an upper bound on how long it may take, returning its own
+# exit status, or a failure if the bound was reached.
+#
+# Built from the shell rather than from `timeout(1)`, which is GNU coreutils and
+# is not present on a stock macOS -- reaching for it would trade an unbounded
+# wait for a portability break, which is a bad exchange in a file that already
+# only runs on darwin. [LAW:no-ambient-temporal-coupling] nothing in this stack
+# waits without a bound; this is what lets that stay true for an external command
+# that has no timeout flag of its own.
+ct_run_bounded() {
+  local seconds="$1" worker timer status fired
+  shift
+  # The timer records that it acted, and the caller reads that rather than
+  # inferring it. "Died from a signal" and "we stopped it" are different facts
+  # and 128+signal cannot tell them apart: a worker that segfaults in its first
+  # second looks exactly like one killed at the bound, so a caller reading the
+  # exit code alone reports an instant crash as a 60s hang. Elapsed time would
+  # be the same guess wearing a clock. [LAW:no-ambient-temporal-coupling]
+  #
+  # mktemp creates it, so nothing in a shared /tmp can be pointed at; the flag
+  # is the file being non-empty, which only this timer writes.
+  fired="$(mktemp "${TMPDIR:-/tmp}/ct_bound.XXXXXX")"
+  # `set -m` for the launch and nothing else. Without job control a background
+  # job inherits ct's own process group, which makes a group signal a suicide
+  # note; with it the worker leads a group of its own, so the group is both the
+  # right target and a safe one.
+  #
+  # The doubt worth pre-empting, because it is the right one to have: bash
+  # disables job control in subshells, and every caller reaches this through
+  # `$( )` -- ct_lit_status runs the worker inside one and is itself read inside
+  # another. If job control did not survive that, `-$worker` would name a group
+  # that does not exist, `2>/dev/null` would swallow the complaint, and the bound
+  # would be quietly gone. `set -m` issued INSIDE the substitution subshell does
+  # apply to jobs started there; measured at both depths, worker pgid equal to
+  # its own pid and never ct's, and end to end through ct_lit_status against a
+  # lit that hangs, ignores TERM and forks: returned at the bound, no survivors.
+  # bash 5.3.9. Re-measure before trusting this on another shell.
+  set -m; "$@" & worker=$!; set +m
+  # The GROUP, and then twice, because a bound that a worker can decline is not
+  # a bound. Signalling only the leader misses whatever it forked -- lit opens a
+  # Dolt store, which is exactly that shape, and an orphan holding a store lock
+  # blocks the NEXT `./ct verify` rather than this one. Signalling only TERM
+  # misses whatever traps it: with a worker that ignores TERM, this function was
+  # measured hanging indefinitely past its own bound, which is the one failure
+  # its whole existence is meant to rule out. KILL cannot be trapped, so the
+  # bound stops being a request. [LAW:no-ambient-temporal-coupling]
+  #
+  # The timer's own output goes to /dev/null, and that redirect is load-bearing
+  # rather than tidiness. A caller capturing this function's stdout -- which
+  # ct_lit_status does -- is waiting on the PIPE, not on the worker, so it waits
+  # until every process holding the write end has let go. Killing the timer
+  # below leaves its `sleep` orphaned still holding that end, so without this
+  # redirect a worker that succeeded instantly still blocked the caller for the
+  # entire bound: measured at 60s for a command that exited in 0s, and 0s for
+  # the identical call left uncaptured. The bound silently became the latency.
+  { sleep "$seconds"
+    printf 1 > "$fired"
+    kill -TERM -- -"$worker" 2>/dev/null
+    sleep "$KILL_GRACE_SECONDS"
+    kill -KILL -- -"$worker" 2>/dev/null
+  } >/dev/null 2>&1 & timer=$!
+  # A killed worker comes back non-zero, which is the answer the caller wants:
+  # a command that had to be stopped did not succeed.
+  wait "$worker" 2>/dev/null && status=0 || status=$?
+  # The timer by PID and deliberately not by group: it was launched without
+  # `set -m`, so it is still in ct's own group, and `-$timer` here would signal
+  # ct itself. The asymmetry with the worker above is the whole reason the
+  # launch is the only thing `set -m` wraps.
+  #
+  # [LAW:no-silent-failure] exception: the timer has usually already exited on
+  # its own by now, and a kill that finds nothing to kill is the expected case
+  # rather than a fault. Nothing downstream reads this outcome.
+  kill -TERM "$timer" 2>/dev/null || :
+  # 124, the status timeout(1) reports for the same event, so a caller that
+  # already knows that convention needs no local one. It replaces the worker's
+  # own status rather than sitting beside it: once we killed it, whatever it
+  # exited with is an artefact of the killing, not news about the work.
+  #
+  # Only ever over a FAILURE, though. The timer writes its flag and then
+  # signals, so a worker that finishes on its own in that gap -- at a bound of
+  # 60s, one that took 59.9s -- exits 0 with the flag already set. Overriding
+  # there would throw away a completed export and report the timeout that did
+  # not happen: `ct_lit_status` would call a perfectly good backlog `broken`.
+  # The flag says the timer acted, never that the killing worked; a zero status
+  # is proof it did not, and the succeeding run is the one telling the truth.
+  if [ "$status" -ne 0 ] && [ -s "$fired" ]; then status=124; fi
+  rm -f "$fired"
+  return "$status"
+}
+
 ct_stop_service() {
   local name="$1" pid
   pid="$(ct_pid_of "$name")"
@@ -116,9 +233,173 @@ ct_report_service() {
 
 # --- subcommands ------------------------------------------------------------
 
+# The whole of what ClickHouse knows about lit: run `lit export` in one named
+# workspace and let the query parse it.
+#
+# Generated rather than committed because it carries a path, and the path is
+# CT_LIT_WORKSPACE -- so the workspace the ticket views answer for is named in
+# lib/common.sh and nowhere else. Rewritten on every `./ct up`, which is what
+# makes repointing it a matter of setting the variable and starting the stack
+# rather than editing a file the next `up` would overwrite anyway.
+#
+# `exec lit export` and nothing more: no filtering, no reshaping, no jq. Every
+# field this stack reads out of lit is read by the SQL in config/clickhouse.yaml,
+# so there is one place where lit's export shape is interpreted, and a shell
+# script cannot come to disagree with it. [LAW:one-source-of-truth]
+#
+# set -eu, and no fallback of any kind. A missing lit or a workspace that has
+# moved must reach ClickHouse as a failed command producing nothing, because the
+# view's border is built to turn exactly that into a loud error -- printing an
+# empty document here instead would sail straight through it as an empty
+# backlog. [LAW:no-silent-failure]
+# Staged and renamed rather than written in place, which matters because this
+# runs on every `./ct up` -- including against a stack that is already serving
+# queries. `cat >` truncates before it writes and chmod lands after, so an
+# in-place rewrite gives a concurrent claude.ticket_events query a window in
+# which it can exec a half-written or not-yet-executable script and fail with
+# "lit produced no export" while lit is perfectly healthy. A rename is atomic, so
+# a reader sees the whole old script or the whole new one.
+# [LAW:no-ambient-temporal-coupling] correctness here does not rest on that
+# window being narrow. Same idiom ct_install_tool uses, for the same reason.
+ct_write_lit_bridge() {
+  local script="$CT_CLICKHOUSE_SCRIPTS_DIR/$CT_LIT_EXPORT_SCRIPT" staged
+  # Unique per invocation, not a fixed `.staging`. The rename protects a READER
+  # from a half-written file; a shared staging path leaves two concurrent `./ct
+  # up` runs -- two terminals, a re-entrant script, CI firing twice -- both
+  # truncating and writing the same file, and whichever `mv` lands last then
+  # publishes the interleaved result atomically. That is the same corrupt script
+  # the staging exists to prevent, moved from the reader side to the writer
+  # side, and published invisibly rather than caught. $$ is what makes the two
+  # writers not share a file. [LAW:no-ambient-temporal-coupling]
+  staged="$script.staging.$$"
+  # Named here because this is the one moment the path is committed to: the
+  # script below bakes it in, and every later reader is ClickHouse, whose
+  # complaint arrives at query time and out of context. Loud, and deliberately
+  # not fatal -- `./ct up` refusing to start a telemetry stack over a missing
+  # issue tracker is the same defect the source-time check had, moved one
+  # command over. The script is still written pointing where it was told, and
+  # nothing downstream launders the result: the yaml border throws on a query,
+  # and verify reports the absence. [LAW:no-silent-failure]
+  [ -d "$CT_LIT_WORKSPACE" ] || ct_warn "CT_LIT_WORKSPACE is not a directory that exists: $CT_LIT_WORKSPACE
+  The stack starts either way -- lit is not part of it. The ticket views are
+  what will not answer, and they will say so when asked."
+  # bash, not sh, and that is about the quoting rather than about needing bash:
+  # the path below is escaped with printf '%q', which is bash's own quoting and
+  # emits $'...' for anything non-printable. A stock dash does not read $'...',
+  # so declaring #!/bin/sh would make the escaping that exists to keep odd paths
+  # safe the very thing that breaks them.
+  cat > "$staged" <<EOF
+#!/usr/bin/env bash
+# Generated by ./ct up from CT_LIT_WORKSPACE -- edits here are overwritten.
+# Read by claude.ticket_events via ClickHouse's executable() table function.
+set -eu
+cd $(printf '%q' "$CT_LIT_WORKSPACE")
+exec lit export
+EOF
+  chmod +x "$staged"
+  mv "$staged" "$script"
+}
+
+# What lit has to say about the configured workspace, as one of three words on
+# stdout: `absent`, `ready`, or `broken` followed by lit's own complaint.
+#
+# Three, and not a boolean, because a boolean has already thrown away the
+# distinction that matters. "There is no tracker here" and "the tracker is
+# broken" are opposite facts, and collapsing them into one `false` makes the
+# second one arrive as the first: a workspace that answered yesterday and fails
+# today over a half-migrated Dolt store, a permissions change, or a lit version
+# bump would report as a checkout that simply has no backlog, and `./ct verify`
+# would go green over it. That is the answer-shaped void this PR removed from
+# clickhouse_returns_a_row and ct_price_failure_reason, and it had grown back
+# one layer up. [LAW:parse-dont-validate]
+#
+# What separates the two arms is whether lit was there to be asked. Absence is
+# a real answer, not a failure -- the same reading ct_probe_repo_name makes of a
+# directory that is not a git checkout. lit is not part of this stack:
+# ct_install_tools does not provision it, no lit store is committed (it lives in
+# .git/links, which is not cloned), and plenty of checkouts this stack is
+# pointed at will have no backlog. A tracing stack whose telemetry path is
+# perfect should not fail its own verification over an issue tracker it does not
+# ship. But an installed lit failing on a real workspace is not that case, and
+# reporting it as that case is a lie. [LAW:dataflow-not-control-flow] the word
+# picks the outcome; the caller runs no different query to find out which.
+#
+# Deliberately asks lit the same question ClickHouse will, so a workspace that
+# answers here and not there is a real difference worth reporting rather than two
+# notions of "configured" that can disagree. [LAW:single-enforcer]
+#
+# Bounded at the same 60s ClickHouse gives the identical call through
+# command_read_timeout. lit opens a Dolt store, which can carry remotes and take
+# locks, so "it will be quick" is an assumption rather than a guarantee -- and an
+# unbounded wait here would hang `./ct verify` with no diagnostic at all.
+# The cd runs in a child rather than a subshell here because ct_run_bounded needs
+# a process it can put a bound on, and $1 is passed as an argument rather than
+# interpolated so a workspace path never becomes part of the script text.
+# shellcheck disable=SC2016  # $1 is for the inner bash to expand, deliberately
+ct_lit_status() {
+  local complaint status gitdir
+  # Three ways for there to be nothing here, and they are one fact: no lit to
+  # ask, nowhere to ask it about, or a workspace nobody ever ran `lit init` in.
+  #
+  # That third one is not pedantry. lit lives on developers' PATHs for other
+  # repos, and the DEFAULT workspace is this checkout -- whose store is never
+  # cloned. Without this arm, the fresh-clone Quickstart hard-fails for anyone
+  # who happens to have lit installed: `lit export` exits 1 ("links requires
+  # running inside a git repository/worktree with links initialized"), which is
+  # indistinguishable from a real breakage unless we ask first whether there was
+  # ever a store to break. Nothing ever worked here, so nothing stopped working.
+  #
+  # git is asked where the store would be rather than told. `<workspace>/.git`
+  # is a DIRECTORY only in an ordinary checkout; in a worktree it is a file
+  # holding a gitdir pointer, so testing `.git/links` there is false however
+  # well lit is set up -- and the README invites pointing CT_LIT_WORKSPACE at
+  # another checkout, worktrees included. Measured: `lit init` in a worktree
+  # succeeds and puts its store in the COMMON git dir, so that is the one to
+  # look in. A directory that is no git repository at all fails rev-parse and
+  # lands here too, which is right for a tool that requires one.
+  { command -v lit >/dev/null && [ -d "$CT_LIT_WORKSPACE" ]; } \
+    || { printf 'absent'; return 0; }
+  gitdir="$(git -C "$CT_LIT_WORKSPACE" rev-parse --git-common-dir 2>/dev/null)" \
+    || { printf 'absent'; return 0; }
+  # --git-common-dir may answer relatively, and it answers relative to the
+  # directory git ran in, which -C made the workspace. Resolving it here rather
+  # than asking for --path-format=absolute keeps this working on any git that
+  # has worktrees at all: that flag is git 2.31, and on anything older it fails
+  # as an unknown option, which this function would have read as "no store
+  # here" and silently skipped the ticket join for every workspace on the
+  # machine. Same false negative the .git/links assumption produced, one layer
+  # further down. [LAW:no-silent-failure]
+  case "$gitdir" in /*) ;; *) gitdir="$CT_LIT_WORKSPACE/$gitdir" ;; esac
+  [ -d "$gitdir/links" ] || { printf 'absent'; return 0; }
+  # stdout dropped, stderr kept -- the export itself is not wanted here, only
+  # whether producing it worked and, when it did not, what lit said about it.
+  # Discarding both is what left the old version with nothing to report.
+  complaint="$(ct_run_bounded "$CT_LIT_TIMEOUT_SECONDS" \
+                 bash -c 'cd "$1" && lit export' _ "$CT_LIT_WORKSPACE" 2>&1 >/dev/null)" \
+    && status=0 || status=$?
+  # One status, four readings, and no arm that can render `broken` followed by
+  # nothing -- which is the whole reason this reports a value rather than a
+  # boolean. 124 is ct_run_bounded saying it did the killing, so a hang is
+  # reported as a hang; a worker that hung says nothing before it goes, and
+  # quoting its empty stderr would throw away the one fact worth having. An
+  # ordinary failure that also said nothing gets its status named instead of a
+  # blank line. [LAW:no-silent-failure]
+  if [ "$status" -eq 0 ]; then
+    printf 'ready'
+  elif [ "$status" -eq 124 ]; then
+    printf 'broken\tno answer within %ss; it was still running and had to be killed' \
+           "$CT_LIT_TIMEOUT_SECONDS"
+  elif [ -n "$complaint" ]; then
+    printf 'broken\t%s' "$complaint"
+  else
+    printf 'broken\t(lit exited %s without writing anything to stderr)' "$status"
+  fi
+}
+
 cmd_up() {
   mkdir -p "$CT_BIN_DIR" "$CT_RUN_DIR" "$CT_LOG_DIR" "$CT_VAR_DIR/jaeger" \
-           "$CT_CLICKHOUSE_DATA_DIR"
+           "$CT_CLICKHOUSE_DATA_DIR" "$CT_CLICKHOUSE_SCRIPTS_DIR"
+  ct_write_lit_bridge
   ct_install_tools
   ct_for_each_service ct_start_service
   echo
@@ -147,7 +428,10 @@ cmd_sql() {
   local query="$*"
   [ -n "$query" ] || ct_die "usage: ct sql <query>
   e.g.  ./ct sql \"SELECT SpanType, count() FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
-  ct_clickhouse "$query" || ct_die "ClickHouse rejected the query, or is not up. Check: ./ct status"
+  # The lit-backed bound, because this runs whatever the user typed and the
+  # README's own worked example is a claude.ticket_turns query.
+  ct_clickhouse "$CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS" "$query" \
+    || ct_die "ClickHouse rejected the query, or is not up. Check: ./ct status"
 }
 
 cmd_logs() {
@@ -340,7 +624,7 @@ ct_price_failure_reason() {
   #
   # A plain assignment rather than `local row=...`: `local` contributes its own
   # exit status and would mask the failure this branch exists to notice.
-  if ! row="$(ct_clickhouse "SELECT countIf(NOT Priced),
+  if ! row="$(ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "SELECT countIf(NOT Priced),
                                     count(),
                                     sum(CostUSD),
                                     arrayStringConcat(groupUniqArrayIf(Model, NOT Priced), ' '),
@@ -417,7 +701,7 @@ ct_price_failure_reason() {
 # this is here to catch. [LAW:parse-dont-validate]
 clickhouse_returns_a_row() {
   local rows
-  rows="$(ct_clickhouse "$1")" || return 1
+  rows="$(ct_clickhouse "$CT_CLICKHOUSE_TIMEOUT_SECONDS" "$1")" || return 1
   [ -n "$rows" ]
 }
 
@@ -572,8 +856,116 @@ claude_labels_searchable() {
     "$(ct_join_labels jaeger_tag_of),$(jaeger_tag_of session.id "$1")"
 }
 
+# [LAW:verifiable-goals] Dollars are not the end of the ladder: the epic's
+# remaining questions are per TICKET, and a ticket is the one thing no span
+# carries. That join runs out to lit and back, and both of its halves fail by
+# going quiet rather than by erroring, which is why they are asserted at all.
+#
+# Runs only once ct_lit_status has reported `ready` -- lit runs and exports for this
+# workspace, and that is what lets these messages be specific: "lit is not
+# installed" is already excluded before either assertion fires, so neither has to
+# hedge across it. What remains are two narrower faults, and each message names
+# the one its check can actually establish.
+#
+# Both checks distinguish a query that failed from a query that found nothing --
+# clickhouse_returns_a_row collapses the two into one false, so the ClickHouse
+# error is re-read here and reported as itself. Without that, the yaml border
+# throwing (lit unreachable from the SERVER, a drifted export schema) would be
+# reported as a parse gone blank, sending the reader to compare JSONExtract calls
+# while the border's own message -- which is accurate -- goes unseen.
+# [LAW:parse-dont-validate] a false diagnosis is worse than none.
+verify_ticket_join() {
+  local query counts events usable agent_events joinable
+
+  # ONE query, four counts, and the values pick the outcome rather than the
+  # caller running a different query per case -- the shape ct_price_failure_reason
+  # already uses here. It has to be one query because the cases are only
+  # distinguishable together: "no rows at all" and "rows whose fields are blank"
+  # both reduce to an empty result when asked separately, and they mean opposite
+  # things. [LAW:parse-dont-validate]
+  #
+  # Safe to split on tabs despite IFS collapsing runs of them, because every
+  # field here is a count and a count is never the empty string.
+  query="SELECT count(),
+                countIf(Ticket != '' AND ToStatus != ''),
+                countIf(startsWith(Actor, 'claude_')),
+                countIf(match(SessionId, '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
+           FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_EVENTS_VIEW
+          FORMAT TSV"
+  counts="$(ct_clickhouse "$CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS" "$query")" \
+    || ct_die "lit exports fine from this shell, but $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_EVENTS_VIEW could not read it.
+  Known causes, and ClickHouse usually says which:
+    - lit is not on the PATH of the ClickHouse process, though it is on this one
+    - lit's export schema moved, and the view's border says so by version
+    - CT_LIT_WORKSPACE changed since the last \`./ct up\`, so $CT_LIT_EXPORT_SCRIPT
+      still cds into the old one -- re-run \`./ct up\` to rewrite it
+  The check above probes the workspace this shell is pointed at; the query goes
+  through the script the last \`./ct up\` wrote. Those are allowed to differ, and
+  only the first one follows the variable.
+  $(ct_clickhouse_error "$CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS" "$query")"
+  IFS=$'\t' read -r events usable agent_events joinable <<< "$counts"
+
+  # An initialised workspace nobody has filed a ticket in yet is a legitimate
+  # state, not a broken one, and reporting it is the same call ct_lit_status
+  # makes about a workspace that does not exist. Asserting on the fields of rows
+  # that are not there would fail here and blame the parse for it.
+  [ "$events" -gt 0 ] || {
+    ct_info "  no ticket history at $CT_LIT_WORKSPACE -- ticket join not checked"
+    return 0
+  }
+
+  # JSONExtractString answers '' for a key that is not there. So if lit renames
+  # issue_id, nothing throws -- the row count is unchanged and every row is
+  # blank, and every ticket question answers zero. This is why the check is on
+  # the extracted VALUES and not on whether lit answered.
+  #
+  # ToStatus and not Action, though Action is the more obvious field to reach
+  # for. Action is carried for readers and nothing joins on it, so asserting it
+  # would fail the day lit stopped emitting a label nothing here needs. ToStatus
+  # is the opposite: the window is built from it, and it comes out of the nested
+  # `changes` array, the most involved extraction in the view and so the one most
+  # likely to go quietly wrong. Assert what the join actually rests on.
+  [ "$usable" -gt 0 ] \
+    || ct_die "lit returned $events events and not one of them parsed.
+  Every Ticket or ToStatus came back empty, and a renamed key reads as a blank
+  string rather than an error -- so every ticket question would quietly answer
+  zero. Compare a raw event against the JSONExtract calls in
+  config/clickhouse.yaml:
+    lit export | head -40"
+
+  # The linchpin of the whole join, and the least obvious thing to depend on:
+  # lit writes its actor as `claude_<session id>`, where that id is the very one
+  # Claude Code stamps on its telemetry. Nothing coordinates those two -- they
+  # agree because Claude Code tells lit who it is -- so the day the format gains
+  # a suffix, SessionId stops matching any span, every ticket comes back with no
+  # turns, and no error is raised anywhere. [LAW:no-silent-failure]
+  #
+  # Only assertable where there is something to assert about. A tracker moved by
+  # humans alone, or one this stack was pointed at after the fact, has no
+  # claude_ actors at all and nothing is wrong with it -- while a workspace that
+  # HAS them and yields no session id has drifted. The two are separated by
+  # asking whether any actor carries the prefix, and the case that cannot be
+  # separated -- a change to the prefix itself -- is reported as exactly that
+  # rather than dressed up as a clean result.
+  [ "$agent_events" -gt 0 ] || {
+    ct_info "  no lit event here was authored by a Claude session -- join key unverified"
+    ct_info "  (either none has moved a ticket yet, or the claude_ prefix changed)"
+    return 0
+  }
+  [ "$joinable" -gt 0 ] \
+    || ct_die "lit has $agent_events events authored by a Claude session, and not one
+  of them yields a session id spans can be joined on.
+  $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_TURNS_VIEW joins on that id alone,
+  so every ticket will report no turns, silently.
+  What lit is actually writing:
+    ./ct sql \"SELECT DISTINCT Actor FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_EVENTS_VIEW FORMAT TSV\""
+
+  ct_ok "  lit's history is readable, and its actors are session ids spans can be joined on"
+}
+
 verify_claude() {
-  local needle labels
+  local ticket_hint=""
+  local needle labels lit_status
   needle="$(ct_uuid)"
   labels="$(ct_work_labels)"
 
@@ -689,11 +1081,38 @@ verify_claude() {
     || ct_die "$(ct_price_failure_reason "$needle")"
 
   ct_ok "  every request is priced, and the session has a dollar cost"
+
+  # Three arms because ct_lit_status reports three states, and the middle one is
+  # the point: a stack with no lit says so by name and verify goes on to pass,
+  # because failing over it would make an issue tracker this stack does not
+  # install a precondition of the telemetry path -- the state of this file two
+  # commits ago. A lit that is installed and failing is not that case and does
+  # not get that mercy: it is a regression in something that worked, and passing
+  # green over it is the silent failure the `absent` arm is often mistaken for.
+  # [LAW:no-silent-failure]
+  lit_status="$(ct_lit_status)"
+  case "${lit_status%%$'\t'*}" in
+    ready)
+      verify_ticket_join
+      ticket_hint="./ct sql \"SELECT Ticket, count() AS Turns, round(sum(CostUSD), 2) AS USD FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TICKET_TURNS_VIEW WHERE Completed GROUP BY Ticket FORMAT PrettyCompact\""
+      ;;
+    absent)
+      ct_info "  no lit workspace answers at $CT_LIT_WORKSPACE -- ticket join not checked"
+      ;;
+    broken)
+      ct_die "lit is installed, $CT_LIT_WORKSPACE has a lit store, and the export still failed.
+  A store that will not export is a fault rather than an empty backlog, which is
+  why this is fatal where a missing tracker is not. What is wrong is lit's to
+  say, and it does:
+  ${lit_status#*$'\t'}"
+      ;;
+  esac
   echo
   ct_trace "http://127.0.0.1:$CT_JAEGER_UI_PORT/search?service=$CLAUDE_SERVICE_NAME&operation=claude_code.interaction"
   ct_trace "./ct sql \"SELECT Model, sum(OutputTokens) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_TABLE GROUP BY 1 FORMAT PrettyCompact\""
   ct_trace "./ct sql \"SELECT sumIf(TotalTokens, ServesToolCall) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
   ct_trace "./ct sql \"SELECT round(sumIf(CostUSD, ServesToolCall), 2) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
+  [ -z "$ticket_hint" ] || ct_trace "$ticket_hint"
 }
 
 cmd_verify() {

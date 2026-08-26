@@ -66,6 +66,110 @@ CT_CLICKHOUSE_REQUESTS_VIEW=llm_requests
 # invariant has exactly one enforcer and does not need a second here.
 CT_CLICKHOUSE_PRICES_VIEW=model_prices
 
+# --- the lit bridge ---------------------------------------------------------
+# Which ticket a session was working on is a fact lit already owns, so nothing
+# here stamps it onto a span. lit's event log records the actor of every
+# transition as `claude_<session id>` -- literally the id Claude Code stamps on
+# its own telemetry -- so the two sides already share a key and the join needs no
+# correlation, no time window and no new attribute. A stamped ticket label would
+# be a second, worse answer to a question lit answers exactly: it would be
+# written at session start, and so could never know the ticket later closed.
+# [LAW:one-source-of-truth]
+#
+# ClickHouse reaches lit by running this script at query time rather than by
+# importing its history, which is what keeps lit authoritative. An imported copy
+# would need a sync command, and a sync command that nobody remembers to run is a
+# store that answers yesterday's question with today's confidence.
+CT_CLICKHOUSE_SCRIPTS_DIR="$CT_CLICKHOUSE_DATA_DIR/user_scripts"
+
+# The two below are NOT held true the same way, and the difference is worth
+# stating rather than leaving to look symmetrical.
+#
+# The directory is genuinely single-sourced: clickhouse.yaml's user_scripts_path
+# reads this exact variable through @from_env, so both sides cannot disagree
+# about where the script lives.
+#
+# The filename cannot be. It appears inside executable('lit_export.sh', ...),
+# and ClickHouse substitutes whole values, never substrings of a query -- the
+# same limitation that keeps claude.spans and the TTL written out in the DDL. So
+# config/clickhouse.yaml holds a second copy of this name, and renaming here
+# without renaming there would have `ct` write a script ClickHouse never looks
+# for. What holds the copy true is a check that fails loudly rather than trust,
+# exactly as with CT_CLICKHOUSE_TABLE: a mismatch means executable() finds
+# nothing, the view's border throws, and `ct verify`'s ticket assertions die
+# naming it. [LAW:one-source-of-truth]
+CT_LIT_EXPORT_SCRIPT=lit_export.sh
+
+# The lit workspace those tickets live in. One value, because ClickHouse is one
+# server: the stack can trace any repo, but the ticket views answer for exactly
+# one backlog, and this names which. Override it to point the join at another
+# checkout, then re-run `./ct up` to rewrite the script.
+#
+# Resolved to an absolute path here, because a relative one means different
+# directories to different readers. It is `cd`'d into by at least two processes
+# with unrelated working directories -- `ct` itself, from wherever the user
+# invoked it, and the ClickHouse server running the generated bridge script at
+# query time -- so `CT_LIT_WORKSPACE=../other-project`, which is the natural
+# reading of the sentence above, would silently name two different trees. One
+# string, one directory, decided once. [LAW:one-source-of-truth]
+#
+# Resolution only. Whether a workspace that is not there is FATAL is the
+# caller's question, not this file's, and answering it here answered it for
+# everyone: this file is sourced by every subcommand, so a `[ -d ] || exit 1`
+# on this line took `down`, `status`, `logs`, `ui`, `env` and `sql` down with
+# it -- none of which read the workspace, and one of which is how a running
+# stack is stopped. Pointing the join at a checkout that later gets renamed
+# would leave the stack unstoppable by its own tool. An issue tracker this
+# stack does not install cannot be a precondition of the stack's lifecycle,
+# and that has to include its path being reachable. [LAW:locality-or-seam]
+#
+# A path that does not resolve is left exactly as configured rather than
+# becoming the empty string a failed `cd` would assign, so the two places that
+# do care -- ct_write_lit_bridge and ct_lit_status -- can name what the user
+# actually asked for.
+: "${CT_LIT_WORKSPACE:=$CT_ROOT}"
+CT_LIT_WORKSPACE="$([ -d "$CT_LIT_WORKSPACE" ] && cd "$CT_LIT_WORKSPACE" && pwd \
+                   || printf '%s' "$CT_LIT_WORKSPACE")"
+
+# How long lit may take to answer before `ct` stops waiting on it. Matches the
+# command_read_timeout config/clickhouse.yaml gives the very same call, so the
+# two sides agree on how patient this stack is with Dolt.
+CT_LIT_TIMEOUT_SECONDS=60
+
+# How long `ct` waits on a ClickHouse query over HTTP. Two bounds, because
+# there are two kinds of query and one number cannot be right for both: a span
+# query talks to ClickHouse alone, while claude.ticket_events runs `lit export`
+# through executable() and so is entitled to lit's patience on top of
+# ClickHouse's own. Which one applies is a property of the query, so the caller
+# passes it rather than every caller inheriting the slowest case.
+# [LAW:dataflow-not-control-flow]
+#
+# The lit-backed bound is derived and not written down: below
+# CT_LIT_TIMEOUT_SECONDS, curl hangs up on a query the server is still lawfully
+# working on and the failure arrives as a timeout under a die message that
+# enumerates causes it is not. Two independently written numbers describing one
+# wait had already drifted to 30 and 60 once. [LAW:one-source-of-truth]
+CT_CLICKHOUSE_TIMEOUT_SECONDS=30
+CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS=$(( CT_LIT_TIMEOUT_SECONDS + CT_CLICKHOUSE_TIMEOUT_SECONDS ))
+
+# lit's history as rows, and the turn grain attributed to a ticket. The two sit
+# on opposite sides of the distinction drawn above, and are worth keeping apart
+# for the same reason model_prices is.
+#
+# ticket_events buys real drift protection: `ct verify` interpolates it into two
+# assertions that actually run, so a rename that missed this file is a query
+# ClickHouse rejects on the next verify.
+#
+# ticket_turns buys none. It appears only in the text of a message and a
+# suggested command, exactly like CT_CLICKHOUSE_PRICES_VIEW, so a rename in
+# config/clickhouse.yaml would leave the guidance pointing at something that no
+# longer exists and nothing would say so. What holds it true is upstream:
+# ticket_turns selects from ticket_events and session_turns, so a renamed or
+# missing source fails CREATE VIEW at startup under throw_on_error and ClickHouse
+# never becomes ready. [LAW:single-enforcer]
+CT_CLICKHOUSE_TICKET_EVENTS_VIEW=ticket_events
+CT_CLICKHOUSE_TICKET_TURNS_VIEW=ticket_turns
+
 # How long spans survive on disk before badger expires them.
 #
 # ClickHouse's own retention is not here, and deliberately: it is a TTL clause
@@ -82,7 +186,10 @@ export CT_JAEGER_OTLP_PORT CT_JAEGER_UI_PORT CT_JAEGER_HEALTH_PORT
 export CT_JAEGER_TELEMETRY_PORT CT_TRACE_TTL
 export CT_CLICKHOUSE_HTTP_PORT CT_CLICKHOUSE_NATIVE_PORT CT_CLICKHOUSE_DATA_DIR
 export CT_CLICKHOUSE_DATABASE CT_CLICKHOUSE_TABLE CT_CLICKHOUSE_REQUESTS_VIEW
-export CT_CLICKHOUSE_PRICES_VIEW
+export CT_CLICKHOUSE_PRICES_VIEW CT_CLICKHOUSE_SCRIPTS_DIR
+export CT_LIT_EXPORT_SCRIPT CT_LIT_WORKSPACE CT_LIT_TIMEOUT_SECONDS
+export CT_CLICKHOUSE_TIMEOUT_SECONDS CT_CLICKHOUSE_LIT_TIMEOUT_SECONDS
+export CT_CLICKHOUSE_TICKET_EVENTS_VIEW CT_CLICKHOUSE_TICKET_TURNS_VIEW
 
 # --- pinned tool releases ---------------------------------------------------
 CT_JAEGER_VERSION=2.20.0
