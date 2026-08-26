@@ -425,6 +425,12 @@ ct_stop_service() {
     # of closing its parts. ct_record_pid escalates because there the message
     # has nothing to point at: no record, no pid to find it by later.
     #
+    # Reaching the die below ends the whole of './ct down' -- ct_die is exit 1
+    # and cmd_down is a loop over ct_services -- so the services after this one
+    # are never signalled. That is claude-lifecycle-ts1, and it lives here
+    # rather than in the message: the operator needs what ct knows, and a
+    # tracker id resolvable only by `lit` in this workspace is not that.
+    #
     # "Up to", because this is reached two ways and only one of them waited.
     # ct_signal_until_gone returns immediately when the signal is refused, so a
     # message claiming the bound elapsed would be false in exactly the case an
@@ -438,8 +444,8 @@ ct_stop_service() {
   was refused, kill's own message is directly above this one. Its pidfile is
   left in place, so './ct status' still sees it and './ct up' will not start a
   second copy of it.
-  This ends the run, so anything ct had not reached yet is still running too.
-  './ct status' is the one place that says which -- see claude-lifecycle-ts1."
+  This ends the run, so ct never reached the services after this one and does
+  not know their state. './ct status' is the only thing that does."
     ct_ok "$name stopped"
   else
     ct_info "$name not running"
