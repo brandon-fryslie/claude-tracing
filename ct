@@ -332,13 +332,19 @@ jaeger_traces_tagged() {
 # case, so an outage arrived disguised as an empty list of missing models.
 # [LAW:parse-dont-validate] the empty string was an answer-shaped void.
 ct_price_failure_reason() {
-  local row unpriced requests spend models
+  local row unpriced requests spend models spent_anything
+  # `spend > 0` is answered by the query rather than recomputed from the printed
+  # decimal here: sum(CostUSD) is Decimal(38,12), and comparing its rendering in
+  # the shell would make the branch depend on how ClickHouse chose to format a
+  # number it can already compare exactly. [LAW:parse-dont-validate]
+  #
   # A plain assignment rather than `local row=...`: `local` contributes its own
   # exit status and would mask the failure this branch exists to notice.
   if ! row="$(ct_clickhouse "SELECT countIf(NOT Priced),
                                     count(),
                                     sum(CostUSD),
-                                    arrayStringConcat(groupUniqArrayIf(Model, NOT Priced), ' ')
+                                    arrayStringConcat(groupUniqArrayIf(Model, NOT Priced), ' '),
+                                    sum(CostUSD) > 0
                                FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW
                               WHERE SessionId = '$1' FORMAT TSV")"; then
     printf '%s\n' \
@@ -347,7 +353,16 @@ ct_price_failure_reason() {
       "  than at the rate table. Start with ./ct status, then ./ct logs."
     return
   fi
-  IFS=$'\t' read -r unpriced requests spend models <<<"$row"
+  # Split on newlines rather than `IFS=$'\t' read`. Tab is an IFS *whitespace*
+  # character, so read collapses a run of them: a session with nothing unpriced
+  # sends an empty model field, the two tabs around it become one separator, and
+  # every field after it shifts left -- which silently handed `spent_anything`
+  # the wrong value and sent a positive-cost session down the "cost $0" branch.
+  # Newlines survive the round trip empty, so position stays position.
+  local -a field
+  mapfile -t field < <(tr '\t' '\n' <<<"$row")
+  unpriced="${field[0]}" requests="${field[1]}" spend="${field[2]}"
+  models="${field[3]}"   spent_anything="${field[4]}"
 
   if [ "$requests" = 0 ]; then
     printf '%s\n' \
@@ -372,9 +387,22 @@ ct_price_failure_reason() {
       "" \
       "  Left unpriced, those requests would cost exactly zero dollars and raise nothing, which" \
       "  is the failure this check exists to make loud rather than the one it is reporting."
+  elif [ "$spent_anything" = 1 ]; then
+    # The assertion polls, this runs afterwards, and a batch can land in between.
+    # When it does, the session is now wholly priced and wholly positive -- which
+    # is the assertion's own success condition, arriving too late to be seen.
+    # Without this case the branch below would print a positive figure and then
+    # explain that the session did no billable work, contradicting the number in
+    # the sentence before it.
+    printf '%s\n' \
+      "this session is fully priced and cost \$$spend, so the data is fine -- it just" \
+      "  landed after the check stopped waiting. The assertion polls for up to" \
+      "  ${SINK_TIMEOUT_SECONDS}s, and Claude exports every 5s with the collector batching 2s more," \
+      "  so a slow machine can miss the window by a hair." \
+      "  Run ./ct verify again; if it keeps landing here, raise SINK_TIMEOUT_SECONDS in ct."
   else
     printf '%s\n' \
-      "every one of this session's $requests requests is priced, but they sum to \$$spend." \
+      "every one of this session's $requests requests is priced, yet together they cost \$0." \
       "  So this is not a missing rate. Either the session did no billable work, or a rate" \
       "  in $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_PRICES_VIEW is itself zero." \
       "  Which of the two it is:" \
