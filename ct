@@ -766,8 +766,14 @@ code review|session.purpose=code%20review
 EOF
 }
 
-# Runs first because it costs a second and nothing downstream means anything if
-# it fails. Everything under it decides something before a byte leaves the host:
+# Runs first because it is the cheapest stage and nothing downstream means
+# anything if it fails. Cheapest is not free: measured at 3.9-4.1s over five
+# runs, where the first two checks are milliseconds and the rest is two fixtures
+# being watched for a bounded interval to prove a process is still there --
+# which is an observation that cannot be hurried, only skipped. Compare the
+# minute a full run spends on stages 2 to 4.
+#
+# Everything under it decides something before a byte leaves the host:
 # what a session is labelled, whether a daemon may launch, whether a stopped
 # service is still recorded as running -- so all of it is answerable with the
 # whole stack down, and none of it is answerable by watching a healthy run.
