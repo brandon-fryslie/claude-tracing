@@ -193,7 +193,15 @@ ct_run_bounded() {
   # already knows that convention needs no local one. It replaces the worker's
   # own status rather than sitting beside it: once we killed it, whatever it
   # exited with is an artefact of the killing, not news about the work.
-  if [ -s "$fired" ]; then status=124; fi
+  #
+  # Only ever over a FAILURE, though. The timer writes its flag and then
+  # signals, so a worker that finishes on its own in that gap -- at a bound of
+  # 60s, one that took 59.9s -- exits 0 with the flag already set. Overriding
+  # there would throw away a completed export and report the timeout that did
+  # not happen: `ct_lit_status` would call a perfectly good backlog `broken`.
+  # The flag says the timer acted, never that the killing worked; a zero status
+  # is proof it did not, and the succeeding run is the one telling the truth.
+  if [ "$status" -ne 0 ] && [ -s "$fired" ]; then status=124; fi
   rm -f "$fired"
   return "$status"
 }
