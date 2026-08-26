@@ -864,12 +864,27 @@ startup_scripts:
           SELECT
             SessionId,
             Turn,
+            -- Constant across a session -- it is a resource attribute, fixed
+            -- when the process started -- so any() reads it rather than
+            -- aggregating it, and it plays no part in the grain.
+            any(Purpose) AS Purpose,
             min(Began) AS Began,
             max(Ended) AS Ended
           FROM (
             SELECT
               SessionId,
               InteractionSequence AS Turn,
+              -- Read out of the map rather than promoted to a MATERIALIZED
+              -- column beside Repository and Branch, and that is deliberate:
+              -- CREATE TABLE IF NOT EXISTS is a silent no-op against a table
+              -- that already exists, so a new column there would reach fresh
+              -- installs only, with no error anywhere to say the others were
+              -- skipped. This view is CREATE OR REPLACE and so actually lands.
+              -- Promote it when claude-schema-729 gives the schema a migration
+              -- path; until then the idx_res_attr_key/value bloom filters serve
+              -- the lookup and only the dictionary encoding is forgone.
+              -- [LAW:no-silent-failure]
+              ResourceAttributes['session.purpose'] AS Purpose,
               toDateTime64(Timestamp, 9, 'UTC') AS Began,
               Began + toIntervalNanosecond(Duration) AS Ended
             FROM claude.spans
@@ -887,6 +902,11 @@ startup_scripts:
         )
         SELECT
           turn.SessionId       AS SessionId,
+          -- Stamped by `ct claude` from CT_SESSION_PURPOSE and empty for every
+          -- session launched without one, which reads as "nobody said" rather
+          -- than as a purpose named "". Q2 -- does review converge faster on
+          -- Opus 5 or 4.8 -- is this column plus Model plus a count of turns.
+          turn.Purpose         AS Purpose,
           turn.Turn            AS Turn,
           turn.Began           AS Began,
           turn.Ended           AS Ended,

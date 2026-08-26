@@ -26,7 +26,7 @@ no git branch, no ticket, no notion of what the session was for.
 | Tokens on tool usage in March | **Answered** — `claude.llm_requests`, below | — |
 | Where tokens go past 400k context | Yes | — |
 | Avg turns to complete a ticket | **Answered** — `claude.ticket_turns`, below | — (but no Sonnet 5 turns are recorded) |
-| Opus 5 vs 4.8 review convergence | **Not yet** | what marks a session as a review |
+| Opus 5 vs 4.8 review convergence | **Recording, not yet answerable** — needs review sessions launched from here on | — (nothing before 2026-08-26 can be classified) |
 
 That gap sets the priority for everything else. Storage can be migrated; an attribute
 that was never emitted is gone. **What gets recorded is perishable. Where it's stored is
@@ -48,8 +48,24 @@ of whoever moved a ticket, so the join key existed before the question was asked
 did not hold here: the ticket was ranked last *of the recording work* on the theory that it
 could be built retroactively, and that theory turned out to be exactly right.
 
-What remains is the review question: nothing derives automatically what marks a session as
-a review, and that rides in on the launcher's passthrough.
+The review question closed the way the paragraph above predicted, and is worth reading
+beside the ticket correction because the two came out opposite. As of 2026-08-26,
+`CT_SESSION_PURPOSE=code-review ./ct claude` stamps `session.purpose` on every span of the
+session and `claude.session_turns.Purpose` carries it, so the comparison is the one `GROUP
+BY` the README shows.
+
+**The query returns no rows, and that is the honest answer, not a defect.** It was run on
+2026-08-26 against every session in the store — 42 of them, 52 turns — and not one is a
+review session, of either
+model, because the label did not exist until that day. This is the clean case of the
+perishability argument: unlike the ticket join, there is no `lit`-shaped record hiding a
+key that was already being written, and no amount of later work recovers a single review
+session run before the label landed. The number starts accumulating from the next
+`CT_SESSION_PURPOSE=code-review` launch.
+
+It is a purpose rather than a `review=true` flag so that the next category — docs, spike,
+incident — is a new value rather than a new attribute, a new column, and an edit to every
+query that groups by category.
 
 ## Volume, measured
 
