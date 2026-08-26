@@ -359,9 +359,17 @@ ct_lit_status() {
   # lands here too, which is right for a tool that requires one.
   { command -v lit >/dev/null && [ -d "$CT_LIT_WORKSPACE" ]; } \
     || { printf 'absent'; return 0; }
-  gitdir="$(git -C "$CT_LIT_WORKSPACE" rev-parse --path-format=absolute \
-              --git-common-dir 2>/dev/null)" \
+  gitdir="$(git -C "$CT_LIT_WORKSPACE" rev-parse --git-common-dir 2>/dev/null)" \
     || { printf 'absent'; return 0; }
+  # --git-common-dir may answer relatively, and it answers relative to the
+  # directory git ran in, which -C made the workspace. Resolving it here rather
+  # than asking for --path-format=absolute keeps this working on any git that
+  # has worktrees at all: that flag is git 2.31, and on anything older it fails
+  # as an unknown option, which this function would have read as "no store
+  # here" and silently skipped the ticket join for every workspace on the
+  # machine. Same false negative the .git/links assumption produced, one layer
+  # further down. [LAW:no-silent-failure]
+  case "$gitdir" in /*) ;; *) gitdir="$CT_LIT_WORKSPACE/$gitdir" ;; esac
   [ -d "$gitdir/links" ] || { printf 'absent'; return 0; }
   # stdout dropped, stderr kept -- the export itself is not wanted here, only
   # whether producing it worked and, when it did not, what lit said about it.
@@ -1092,9 +1100,10 @@ verify_claude() {
       ct_info "  no lit workspace answers at $CT_LIT_WORKSPACE -- ticket join not checked"
       ;;
     broken)
-      ct_die "lit is installed and $CT_LIT_WORKSPACE is a directory, but the export failed.
-  That is a fault, not an empty backlog -- something that worked stopped working.
-  lit says:
+      ct_die "lit is installed, $CT_LIT_WORKSPACE has a lit store, and the export still failed.
+  A store that will not export is a fault rather than an empty backlog, which is
+  why this is fatal where a missing tracker is not. What is wrong is lit's to
+  say, and it does:
   ${lit_status#*$'\t'}"
       ;;
   esac
