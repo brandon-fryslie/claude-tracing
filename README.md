@@ -286,12 +286,16 @@ Ask your own store rather than trusting a figure quoted here, because these move
 accumulates:
 
 ```bash
-./ct sql "SELECT round(100*sum(CacheReadCostUSD)/sum(CostUSD), 1)     AS cache_read_pct_spend,
-                 round(100*sum(CacheReadTokens)/sum(TotalTokens), 1)  AS cache_read_pct_tokens,
-                 round(100*sum(OutputCostUSD)/sum(CostUSD), 1)        AS output_pct_spend,
-                 round(100*sum(OutputTokens)/sum(TotalTokens), 1)     AS output_pct_tokens
+./ct sql "SELECT round(100*sum(CacheReadCostUSD)/nullIf(sum(CostUSD), 0), 1)     AS cache_read_pct_spend,
+                 round(100*sum(CacheReadTokens)/nullIf(sum(TotalTokens), 0), 1)  AS cache_read_pct_tokens,
+                 round(100*sum(OutputCostUSD)/nullIf(sum(CostUSD), 0), 1)        AS output_pct_spend,
+                 round(100*sum(OutputTokens)/nullIf(sum(TotalTokens), 0), 1)     AS output_pct_tokens
           FROM claude.llm_requests FORMAT Vertical"
 ```
+
+Run before your first session, that answers `NULL` four times rather than erroring: the
+`nullIf` guards are there because dividing a `Decimal` by zero raises in ClickHouse, and a
+store with no priced requests yet is the state every fresh `./ct up` starts in.
 
 No span carries a cost, so these are derived — token counts times `claude.model_prices`,
 which is a rate table this repo owns and states in `config/clickhouse.yaml`. That has three
@@ -315,10 +319,14 @@ consequences worth knowing before you trust a figure:
   published one is the point: both surprises so far (a suffixed model carrying no premium,
   a cache rate set by the client's cache TTL) were cases where the measured figure and the
   documented one disagreed.
-- **The rates were measured, not looked up.** Claude Code publishes its own cost counter on
-  `:8889`, computed independently, and every rate here was reconciled against it — to the
-  limit of what that counter can state, since it is emitted as a float and the decimal
-  computed here is the more exact of the two. The reconciliation turned up one surprise
+- **The rates were measured, not looked up — with two exceptions, named.** Claude Code
+  publishes its own cost counter on `:8889`, computed independently, and every rate was
+  reconciled against it that there was traffic to reconcile — to the limit of what that
+  counter can state, since it is emitted as a float and the decimal computed here is the
+  more exact of the two. The exceptions are Haiku's cache-read and cache-creation rates:
+  no Haiku request in this store has ever touched the cache, so there is no series to
+  check them against and they remain Opus's published multipliers carried over.
+  `docs/analytics-findings.md` marks which is which. The reconciliation turned up one surprise
   (`claude-opus-5[1m]` carries no long-context premium) and one caveat (cache creation
   bills at 2× input because of the one-hour cache TTL, which no span records).
   [docs/analytics-findings.md](docs/analytics-findings.md) has the procedure, so a future

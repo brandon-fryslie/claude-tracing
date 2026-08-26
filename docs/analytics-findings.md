@@ -318,7 +318,7 @@ invented rather than counted. This table exists so that can't happen quietly aga
 | `claude-opus-5[1m]` carries no long-context price premium | **Measured** — same reconciliation; it bills at plain Opus 5 rates |
 | Cache creation bills at 2× input (the one-hour cache TTL) | **Measured** — solved from the counter; no span records the TTL, so it is a claim about this client's configuration |
 | Haiku 4.5 cache-read and cache-creation rates | **Assumed** — no Haiku request in this store has touched the cache; the published multipliers were carried over from Opus |
-| Rates apply before 2026-08-23 | **Unmeasured** — that is the date they were verified, not the date Anthropic set them. Older spans come back `Priced = false` rather than costed at an unchecked rate |
+| These rates were already in force before 2026-08-23 | **Unmeasured** — that is the date they were verified, not the date Anthropic set them. Rather than cost older spans at a rate nobody checked against them, the join leaves those spans `Priced = false` |
 
 The encoding result is worth stating on its own, because its failure mode is invisible.
 Two runs of the same prompt, one variable changed:
