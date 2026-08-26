@@ -182,7 +182,8 @@ promoted to real columns, computed once when the row is inserted:
 | Column | From |
 | ---------------------------------------------------------- | ----------------------------------- |
 | `SpanType` | `interaction`, `llm_request`, `tool`, `tool.execution`, `tool.blocked_on_user` |
-| `SessionId`, `InteractionSequence` | which session, and which turn within it |
+| `SessionId` | which session — the key to group by; see the trace-id warning below |
+| `InteractionSequence` | which turn within it, and **only on `interaction` spans**: every other span type reads 0, so a request finds its turn by timestamp, not by this |
 | `Model`, `ToolName`, `StopReason` | the obvious grouping keys |
 | `InputTokens`, `OutputTokens`, `CacheReadTokens`, `CacheCreationTokens` | as emitted |
 | `ContextTokens` | input + cache-read + cache-creation: the proxy for context size |
@@ -352,6 +353,79 @@ rather than a new definition. The definition itself lives in `config/clickhouse.
 quietly. A renamed `stop_reason` would take out two of the three clauses; the third reads a
 different attribute entirely and would go on marking every subagent request, so the number
 comes back a large, plausible undercount rather than an obvious zero.
+
+### How many turns a ticket took, and what it cost
+
+```bash
+./ct sql "SELECT Ticket,
+                 count()                 AS turns,
+                 uniqExact(SessionId)    AS sessions,
+                 argMax(Model, TotalTokens) AS model,
+                 round(sum(CostUSD), 2)  AS usd
+          FROM claude.ticket_turns
+          WHERE Completed
+          GROUP BY Ticket ORDER BY min(Started) FORMAT PrettyCompact"
+```
+
+This is the one question that reaches outside the span store, because it needs a fact no
+span can carry: whether the ticket was *finished*. A span is stamped when a session starts
+and never changes, so nothing in it could know about a close that happens hours later in a
+different session. That fact lives in `lit`, this repo's issue tracker.
+
+The join needs no correlation and no guesswork, because both sides already share a key.
+`lit` records the actor of every transition as `claude_<session id>` — literally the id
+Claude Code stamps on its own telemetry. So `claude.ticket_events` runs `lit export` at
+query time and lines its actors up against `SessionId`. Nothing stamps a ticket onto a
+span, and nothing should: it would be a second answer to a question `lit` already answers
+exactly, written at the one moment the answer is least known.
+
+**Turns here are long.** One turn ran 3 hours 35 minutes and did the whole of `zbi.4` —
+116 requests, 19.9M tokens, one prompt. A "turn" is one thing you asked for, not one
+message, so counts are small and the averages read low.
+
+That length is also what makes the obvious query wrong. `zbi.4`'s turn began *two minutes
+before* the `lit start` that claimed the ticket and ran hours past it, so a turn is
+attributed when its interval **overlaps** the ticket's window — not when its start
+timestamp falls inside it. Point containment scores that ticket zero turns, tidily and
+incorrectly.
+
+The full definition, since the number is meaningless without it:
+
+- A ticket's window runs from its first move into `in_progress` to its last into `closed`.
+  A ticket is often not one session — `zbi.5` was started by one and closed by another two
+  days later — so the window, not the session, is the unit.
+- Its sessions are the ones `lit` records acting on it. That is a floor, not a census: a
+  session that worked a ticket and never claimed, closed or commented on it leaves no trace
+  in `lit` and cannot be counted.
+- Turns that invoked no model don't count. Every session on file ends with one or more
+  sub-second turns — a slash command handled locally, an interrupted line — and counting
+  them would inflate every ticket by one or two. They stay visible in
+  `claude.session_turns`, marked `InvokedModel = false`, rather than being quietly dropped.
+- `Completed` is carried so averages can exclude open tickets. Averaging over a ticket
+  still being worked measures how far it has got, not what it took.
+
+Two ways this can still be wrong, both unfixable from here: two tickets open at once share
+their overlapping turns, because nothing records which one a turn was actually for; and a
+ticket whose sessions predate the recording has no turns at all. It is absent from the
+results rather than reported as zero — zero turns is an answer, and this is the absence of
+one.
+
+**Group by `SessionId`, never `TraceId`.** A `claude` launched from inside another
+session's Bash tool call parents its root span to the caller's, so one trace in this store
+holds three distinct sessions — and `ct verify` creates exactly that shape on every run.
+
+`claude.session_turns` sits underneath, one row per turn with its model, tokens and cost
+and no ticket attached, so "where did this session's tokens go" is answerable on its own.
+A turn's `Model` is the model that produced the most main-loop output in it, not the model
+of any one request: turns run subagents on other models and pick up background Haiku calls,
+so the question is about the weight of the work.
+
+If `lit` can't be read, these views raise an error rather than returning no rows. That
+distinction is the whole point — "you have no tickets" and "I couldn't reach the tracker"
+must not arrive as the same answer, or an average over nothing looks like a real number.
+`ct verify` re-checks both halves on every run: that `lit`'s export still parses into the
+fields these views read, and that its actors are still session ids spans can be joined on.
+Both fail silently otherwise — a renamed key reads as an empty string, not an error.
 
 ## What gets recorded
 

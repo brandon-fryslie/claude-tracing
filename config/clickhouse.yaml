@@ -21,6 +21,16 @@ tcp_port:
 path:
   "@from_env": CT_CLICKHOUSE_DATA_DIR
 
+# Where `executable()` looks for the scripts it may run. Stated rather than left
+# to ClickHouse's default of <path>/user_scripts, because `ct` writes the lit
+# bridge into this directory and the two have to agree on where it is. Left
+# implicit, the convention would be spelled once here and once in `ct`, and a
+# server that looked somewhere `ct` never wrote is a ticket join that answers
+# "no tickets" forever. Both read CT_CLICKHOUSE_SCRIPTS_DIR.
+# [LAW:one-source-of-truth]
+user_scripts_path:
+  "@from_env": CT_CLICKHOUSE_SCRIPTS_DIR
+
 # Logs go to stdout, which `ct` redirects into var/log/clickhouse.log alongside
 # the other two services, so `./ct logs` shows all three. `warning` rather than
 # `information` because ClickHouse narrates every background merge at info, and
@@ -544,3 +554,269 @@ startup_scripts:
         JOIN claude.spans AS execution  ON request.ParentSpanId   = execution.SpanId
         JOIN claude.spans AS agent_tool ON execution.ParentSpanId = agent_tool.SpanId
         WHERE request.RequestContext = 'tool'
+
+    # --- tickets ------------------------------------------------------------
+    # The border between this stack and lit. Everything above answers from spans
+    # alone; the three questions about *work* -- how many turns a ticket took,
+    # what it cost, which model drove it -- need one fact no span carries, and
+    # cannot carry: whether the ticket was finished. A span is stamped when a
+    # session starts and is immutable thereafter, so nothing it holds could ever
+    # know about a close that happens hours later in a different session.
+    #
+    # That fact lives in lit, and so does the join key. lit records the actor of
+    # every transition as `claude_<session id>` -- the same id Claude Code stamps
+    # on its own telemetry -- so the two sides already share a key. No ticket
+    # attribute is stamped on any span, and none should be: it would be a second
+    # answer to a question lit answers exactly, written at the one moment the
+    # answer is least known. [LAW:one-source-of-truth]
+    #
+    # `executable` runs the script per query rather than importing lit's history
+    # into a table here. An imported copy would need a refresh command, and the
+    # failure mode of a refresh command is a store that answers a stale question
+    # with a straight face. It costs the few seconds lit takes to open its store,
+    # paid by ticket queries only -- a correctness argument that does not need a
+    # performance one, the same trade claude.subagent_requests makes above.
+    #
+    # THE BORDER IS LOUD, AND HAD TO BE MADE SO. `executable` reports a command
+    # that exits non-zero, or does not exist at all, as zero rows -- so a missing
+    # lit and an empty backlog arrive as the same value, and "average turns per
+    # ticket" over nothing is exactly the confident, wrong, unfalsifiable number
+    # this epic exists to prevent. [LAW:no-silent-failure]
+    #
+    # Two things make the guards below actually run, and both were arrived at by
+    # watching an earlier version fail to.
+    #
+    # The aggregate is what gives them anything to fire on: over zero rows,
+    # count() still yields one row, where a bare filter would have none.
+    #
+    # And each guard is folded into `Document` -- the value the ARRAY JOIN reads
+    # -- rather than sitting in a column of its own, because a column nothing
+    # selects is pruned before it is ever evaluated. Written the obvious way, as
+    # its own named column, the check passed a broken lit straight through:
+    # `SELECT count()` never asked for the guard, so the guard never ran.
+    # substring(x, 1 + throwIf(...)) is x on the happy path and cannot be
+    # optimised away, because Document genuinely depends on it.
+    #
+    # Nesting them is what keeps the two diagnoses apart: the presence guard is
+    # computed first because the version guard reads its output, so an unreadable
+    # lit is reported as an unreadable lit and never as a schema change. That
+    # ordering is a data dependency rather than a hope about evaluation order.
+    # [LAW:parse-dont-validate]
+    - query: |
+        CREATE OR REPLACE VIEW claude.ticket_events AS
+        SELECT
+          JSONExtractString(event, 'issue_id') AS Ticket,
+          JSONExtractString(event, 'actor')    AS Actor,
+          -- Empty for lit's own automated actors, which is the truth: no session
+          -- ran them, so they name a transition but never any turns.
+          if(startsWith(Actor, 'claude_'),
+             substring(Actor, length('claude_') + 1), '') AS SessionId,
+          -- RFC3339 with a Z, so the zone is in the value rather than inherited
+          -- from the host. Pinned to UTC here so the comparison against span
+          -- timestamps is between two instants and not two local readings.
+          parseDateTime64BestEffortOrNull(
+            JSONExtractString(event, 'created_at'), 9, 'UTC') AS At,
+          JSONExtractString(event, 'action')   AS Action,
+          -- The status transition, taken from the event's `changes` rather than
+          -- from `action`: action is a label lit is free to rename and 2 of the
+          -- 45 events on file carry none at all, while a change of the `status`
+          -- field is the state transition itself. Empty when this event changed
+          -- no status -- a comment, a re-parenting, an edited description --
+          -- which still leaves the row, because its actor is a session that
+          -- touched this ticket and participation is what the join needs.
+          JSONExtractString(
+            arrayFirst(change -> JSONExtractString(change, 'field') = 'status',
+                       JSONExtractArrayRaw(event, 'changes')),
+            'to') AS ToStatus
+        FROM (
+          SELECT
+            substring(Present,
+                      1 + throwIf(JSONExtractInt(Present, 'version') != 2,
+                                  'lit export is not schema version 2 -- claude.ticket_events reads a shape lit no longer writes. Compare `lit export` against the JSONExtract calls in config/clickhouse.yaml.')) AS Document
+          FROM (
+            SELECT
+              substring(any(json),
+                        1 + throwIf(count() = 0,
+                                    'lit produced no export, so claude.ticket_events cannot tell an empty backlog from an unreadable one and refuses to answer. Check that lit is on PATH for the ClickHouse process and that the workspace named in the generated user_scripts/lit_export.sh still exists.')) AS Present
+            FROM executable('lit_export.sh', 'JSONAsString', 'json String')
+            -- lit opens a Dolt database to answer, which takes seconds rather
+            -- than milliseconds. ClickHouse's default patience is 10s and a
+            -- backlog only grows, so the wait is stated rather than left to a
+            -- default that a larger backlog would silently start tripping.
+            SETTINGS command_read_timeout = 60000
+          )
+        )
+        ARRAY JOIN JSONExtractArrayRaw(Document, 'events') AS event
+
+    # One row per turn: the grain the epic's turn questions are asked at, and the
+    # only place a turn is defined. It holds no ticket -- a turn is a fact about
+    # a session -- so it also answers "where did this session's tokens go" on its
+    # own, and claude.ticket_turns below is this view plus an attribution.
+    #
+    # A turn is an interaction span, and its requests are the llm_requests of the
+    # same session that fall inside it. They have to be found by time: only
+    # interaction spans carry interaction.sequence -- measured, on every span in
+    # this store -- so an llm_request does not know its own turn number and the
+    # span it belongs to is the one whose window contains it.
+    #
+    # NEVER JOIN THESE BY TRACE ID. A `claude` launched from inside another
+    # session's Bash tool call parents its root span to the caller's, so one
+    # trace here holds three distinct sessions, and `ct verify` creates that
+    # shape on every run. SessionId is the key; TraceId is not.
+    #
+    # The LEFT JOIN is load-bearing. Every session on file ends with one or more
+    # sub-second turns that invoked no model at all -- a slash command handled
+    # locally, an interrupted line -- and an inner join would drop them, making
+    # the join type silently decide what counts as a turn. They are kept, counted
+    # and marked: InvokedModel is the discriminator, so the choice is made by a
+    # named column that a reader can see and audit rather than by a join.
+    # [LAW:dataflow-not-control-flow]
+    #
+    # Model is the model that produced the most main-loop output in the turn, not
+    # the model of any one request. A turn runs subagents on other models and
+    # picks up background haiku calls, so "which model drove this turn" is a
+    # question about the weight of the work, and RequestContext = 'interaction'
+    # is what separates the main loop from the subagents running under it.
+    - query: |
+        CREATE OR REPLACE VIEW claude.session_turns AS
+        SELECT
+          turn.SessionId       AS SessionId,
+          turn.Turn            AS Turn,
+          turn.Began           AS Began,
+          turn.Ended           AS Ended,
+          worked.Model         AS Model,
+          worked.Requests      AS Requests,
+          worked.OutputTokens  AS OutputTokens,
+          worked.TotalTokens   AS TotalTokens,
+          -- Never multiply TotalTokens by a rate: the four counts bill at rates
+          -- spanning 50x. This is the sum of what each request already cost.
+          worked.CostUSD       AS CostUSD,
+          worked.Unpriced = 0  AS Priced,
+          worked.Requests > 0  AS InvokedModel
+        FROM (
+          SELECT
+            SessionId,
+            InteractionSequence AS Turn,
+            toDateTime64(Timestamp, 9, 'UTC') AS Began,
+            Began + toIntervalNanosecond(Duration) AS Ended
+          FROM claude.spans
+          WHERE SpanType = 'interaction'
+        ) AS turn
+        LEFT JOIN (
+          SELECT
+            SessionId,
+            Turn,
+            argMax(Model, MainLoopOutputTokens) AS Model,
+            sum(Requests)     AS Requests,
+            sum(OutputTokens) AS OutputTokens,
+            sum(TotalTokens)  AS TotalTokens,
+            sum(CostUSD)      AS CostUSD,
+            sum(Unpriced)     AS Unpriced
+          FROM (
+            SELECT
+              turn.SessionId AS SessionId,
+              turn.Turn      AS Turn,
+              request.Model  AS Model,
+              sumIf(request.OutputTokens,
+                    request.RequestContext = 'interaction') AS MainLoopOutputTokens,
+              count()                     AS Requests,
+              sum(request.OutputTokens)   AS OutputTokens,
+              sum(request.TotalTokens)    AS TotalTokens,
+              sum(request.CostUSD)        AS CostUSD,
+              countIf(NOT request.Priced) AS Unpriced
+            FROM (
+              SELECT
+                SessionId,
+                InteractionSequence AS Turn,
+                toDateTime64(Timestamp, 9, 'UTC') AS Began,
+                Began + toIntervalNanosecond(Duration) AS Ended
+              FROM claude.spans
+              WHERE SpanType = 'interaction'
+            ) AS turn
+            INNER JOIN claude.llm_requests AS request
+              ON request.SessionId = turn.SessionId
+            WHERE toDateTime64(request.Timestamp, 9, 'UTC')
+                  BETWEEN turn.Began AND turn.Ended
+            GROUP BY SessionId, Turn, Model
+          )
+          GROUP BY SessionId, Turn
+        ) AS worked
+          ON worked.SessionId = turn.SessionId AND worked.Turn = turn.Turn
+
+    # The join this ticket exists for: one row per turn attributed to a ticket.
+    #
+    # WHAT "TURNS TO COMPLETE A TICKET" MEANS HERE, because the number is
+    # confidently wrong under any of the obvious alternatives:
+    #
+    #   A ticket's work window runs from the first transition into in_progress to
+    #   the last into closed. A ticket is rarely one session -- zbi.5 was started
+    #   by one and closed by another two days later -- so the window, not the
+    #   session, is the unit.
+    #
+    #   Its sessions are the ones lit records acting on it. That is a floor and
+    #   not a census: a session that worked a ticket and neither claimed, closed
+    #   nor commented on it leaves no trace in lit and cannot be counted.
+    #
+    #   A turn counts when its interval OVERLAPS the window -- not when its
+    #   timestamp falls inside it. Turns here are long: one turn ran 3.6 hours
+    #   and did the whole of zbi.4, beginning two minutes BEFORE the `lit start`
+    #   that claimed the ticket. Point containment on the start timestamp scores
+    #   that ticket zero turns, which is the wrong answer arrived at tidily.
+    #
+    #   Turns that invoked no model are excluded, by the discriminator
+    #   session_turns names rather than by a join quietly dropping them.
+    #
+    # The window is also what keeps a session that worked several tickets in a
+    # row from being counted whole against each: its turns fall into whichever
+    # window was open at the time. Overlapping windows -- a ticket abandoned and
+    # resumed while another was open -- do count a turn against both, and there
+    # is no way to split it, because nothing records which of the two the turn
+    # was actually for.
+    #
+    # WorkedUntil is a value, not a branch: a ticket that is still open has been
+    # worked up to now, so the window's upper bound is now() rather than a
+    # missing endpoint the join would have to special-case. Completed is carried
+    # so that "turns to COMPLETE a ticket" can exclude the open ones -- averaging
+    # over a ticket still being worked measures how far it has got, not what it
+    # took. [LAW:dataflow-not-control-flow]
+    - query: |
+        CREATE OR REPLACE VIEW claude.ticket_turns AS
+        SELECT
+          life.Ticket       AS Ticket,
+          life.Started      AS Started,
+          life.Closed       AS Closed,
+          life.Completed    AS Completed,
+          turn.SessionId    AS SessionId,
+          turn.Turn         AS Turn,
+          turn.Began        AS Began,
+          turn.Ended        AS Ended,
+          turn.Model        AS Model,
+          turn.Requests     AS Requests,
+          turn.OutputTokens AS OutputTokens,
+          turn.TotalTokens  AS TotalTokens,
+          turn.CostUSD      AS CostUSD,
+          turn.Priced       AS Priced
+        FROM (
+          SELECT
+            Ticket,
+            minIf(At, ToStatus = 'in_progress') AS Started,
+            maxIf(At, ToStatus = 'closed')      AS Closed,
+            countIf(ToStatus = 'closed') > 0    AS Completed,
+            if(Completed, Closed, now64(9, 'UTC')) AS WorkedUntil
+          FROM claude.ticket_events
+          GROUP BY Ticket
+          -- A ticket nobody ever claimed has no window and so no turns. Absent
+          -- rather than zero: zero turns is an answer, and this is the absence
+          -- of one. [LAW:parse-dont-validate]
+          HAVING countIf(ToStatus = 'in_progress') > 0
+        ) AS life
+        INNER JOIN (
+          SELECT DISTINCT Ticket, SessionId
+          FROM claude.ticket_events
+          WHERE SessionId != ''
+        ) AS participant ON participant.Ticket = life.Ticket
+        INNER JOIN claude.session_turns AS turn
+          ON turn.SessionId = participant.SessionId
+        WHERE turn.InvokedModel
+          AND turn.Began <= life.WorkedUntil
+          AND turn.Ended >= life.Started
