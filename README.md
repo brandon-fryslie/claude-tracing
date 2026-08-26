@@ -40,8 +40,10 @@ every one of its requests carrying a price so the session has a cost in dollars.
 One last check runs only if it applies: where a [`lit`](#how-many-turns-a-ticket-took-and-what-it-cost)
 workspace answers, verify confirms its history still parses and its actors are still
 session ids spans can be joined on. With no `lit`, no tickets in it, or no ticket a Claude
-session has moved, it says so and carries on — the telemetry path does not depend on an
-issue tracker this stack doesn't install.
+session has moved — including a checkout nobody ran `lit init` in — it says so and carries
+on: the telemetry path does not depend on an issue tracker this stack doesn't install. The
+one lit problem that does fail the run is a workspace that *has* a store and still can't be
+exported, because that is something that used to work and stopped.
 
 Each stage picks a session id before it emits anything and then asks every sink for that
 exact string, so a pass means this run's data arrived, not that an older trace is still
@@ -420,12 +422,15 @@ The full definition, since the number is meaningless without it:
   would otherwise become a participant in all thirty and donate its turns to whichever
   windows were open. That is a floor, not a census: a session that worked a ticket and never
   transitioned it leaves no trace and cannot be counted.
-- Each session's contribution is capped at the moment it **moved on** — its next transition on
-  a *different* ticket. So the window above is the ticket's bound, and this is a second one
-  laid on top of it per session: a session that claimed a ticket, wandered off to another and
-  never came back stops contributing when it left, not at `now()`. Moving the *same* ticket
-  again — reopening it, closing it a second time — is not moving on, and does not cap anything.
-  A session that never moved anything else is capped by the ticket's window alone.
+- Each session's contribution is capped at the moment it **moved on** — its next transition
+  after its own *last* move on this ticket. So the window above is the ticket's bound, and
+  this is a second one laid on top of it per session: a session that claimed a ticket,
+  wandered off to another and never came back stops contributing when it left, not at `now()`.
+  Anchoring on the last move rather than the first is what lets a session leave and *return* —
+  it is the departure that ends the engagement, not the arrival — so reopening a ticket, or
+  stepping away and coming back to finish it, counts the whole of the work rather than
+  stopping at the first excursion. A session that never moved anything else is capped by the
+  ticket's window alone.
 - Turns that invoked no model don't count. Every session on file ends with one or more
   sub-second turns — a slash command handled locally, an interrupted line — and counting
   them would inflate every ticket by one or two. They stay visible in
@@ -443,6 +448,13 @@ Ways this can still be wrong, none of them fixable from here, worst first:
   turn was actually for.
 - A session that worked a ticket without ever transitioning it is invisible, per the second
   bullet above — its turns land on whatever else it did move, or nowhere.
+- The one that runs the *other* way, and so is the easiest to misread: the floor is the
+  ticket's own start, shared by every session, not each session's own arrival. A session
+  that engages a ticket only late — a single reopen near the end — contributes turns from
+  the ticket's beginning, including turns spent on unrelated work. That **overcounts**,
+  where the three above undercount. The floor is deliberate: `zbi.5`'s closing session has
+  exactly one event on the ticket, the `done` at the very end, so a per-session floor would
+  discard everything it actually did.
 
 Not on that list, because it is the intended behaviour rather than a defect: a ticket whose
 sessions predate the recording has no turns at all, and is absent from the results rather
