@@ -27,19 +27,22 @@ exporters:
     tls:
       insecure: true
 
-  # The second trace sink: a year of spans, answering SQL. Traces are Alpha in
-  # this exporter, which is an argument for keeping badger as the viewing sink
-  # of record -- as the traces pipeline below does -- rather than an argument
-  # against landing the history here.
+  # Two signals land here: a year of spans and a year of events, both answering
+  # SQL. `otelcol-contrib components` reports this exporter Beta for traces and
+  # Beta for logs -- check it there rather than here if it matters, since the
+  # tier moves with the release. Badger stays the viewing sink of record anyway,
+  # as the traces pipeline below shows, because it draws a trace and this cannot.
   #
-  # create_schema is off because ClickHouse creates the table itself at startup
+  # create_schema is off because ClickHouse creates both tables itself at startup
   # (config/clickhouse.yaml), where the partitioning, sort key and one-year TTL
-  # can be stated. Left on, this exporter would create a table with its own
-  # defaults, and every one of those clauses is a migration afterwards.
+  # can be stated. Left on, this exporter would create them with its own defaults
+  # -- daily partitions, and for logs no TTL whatsoever -- and every one of those
+  # clauses is a migration afterwards.
   clickhouse:
     endpoint: tcp://127.0.0.1:${env:CT_CLICKHOUSE_NATIVE_PORT}?dial_timeout=10s
     database: ${env:CT_CLICKHOUSE_DATABASE}
     traces_table_name: ${env:CT_CLICKHOUSE_TABLE}
+    logs_table_name: ${env:CT_CLICKHOUSE_EVENTS_TABLE}
     create_schema: false
 
   # Claude's counters (tokens, cost, tool decisions) as a scrape surface. Curl it
@@ -48,14 +51,6 @@ exporters:
     endpoint: 127.0.0.1:${env:CT_CLAUDE_METRICS_PORT}
     resource_to_telemetry_conversion:
       enabled: true
-
-  # Events (user prompts, tool results, API errors) land as newline-delimited
-  # JSON: durable, greppable, and joinable to spans by session.id / tool_use_id.
-  file/events:
-    path: ${env:CT_VAR_DIR}/log/claude-events.jsonl
-    rotation:
-      max_megabytes: 64
-      max_backups: 3
 
 extensions:
   health_check:
@@ -74,10 +69,15 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [prometheus]
+    # Events go to the same store as the spans, and so inherit the same one-year
+    # TTL rather than carrying a rotation count of their own. The file exporter
+    # this replaced capped them at 64 MB x 4 backups, which measured out to about
+    # two weeks before the oldest data was dropped with no error and no log line;
+    # config/clickhouse.yaml's events table carries the arithmetic.
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [file/events]
+      exporters: [clickhouse]
   telemetry:
     resource:
       attributes:

@@ -131,16 +131,23 @@ two thirds of the telemetry disappears without anyone telling you. The collector
 to give each signal a real sink:
 
 ```
-claude  ──OTLP/gRPC──▶  collector :4317  ──traces──┬▶ jaeger :14317 ──▶ badger    7 days
-                                                   └▶ clickhouse :9000 ──▶ SQL    1 year
+claude  ──OTLP/gRPC──▶  collector :4317  ──traces──┬▶ jaeger :14317 ──▶ badger        7 days
+                                                   └▶ clickhouse :9000 ──▶ claude.spans   1 year
                                          ──metrics─▶  :8889/metrics (Prometheus format)
-                                         ──logs────▶  var/log/claude-events.jsonl
+                                         ──logs────▶  clickhouse :9000 ──▶ claude.events  1 year
 ```
 
 Traces go to two sinks because they answer two different questions. Badger is what
 Jaeger reads to draw one trace, and it holds a week. ClickHouse holds a year and answers
 `sum(tokens) group by month`. Neither depends on the other: if the ClickHouse path
 breaks, viewing still works, and the reverse.
+
+Logs — Claude Code calls them events — go to ClickHouse rather than to a file, and they
+land beside the spans so both signals expire on one clause instead of a TTL for one and a
+rotation count for the other. `claude.events` carries what `claude.spans` cannot: the
+prompt text, the tool result, every hook run, and `api_error` / `api_retries_exhausted`,
+which nothing else in the stack records. Both tables materialize `SessionId`, so an event
+and the span it happened inside join with no correlation and no time window.
 
 Jaeger 2.20 does ship its own ClickHouse backend, and this deliberately doesn't use it —
 the binary prints `WARNING: ClickHouse Storage is Experimental` on the way up, and
@@ -525,10 +532,22 @@ days under `var/jaeger` (`CT_TRACE_TTL` in `lib/common.sh`); ClickHouse keeps a 
 `@from_env` because ClickHouse substitutes whole values, never pieces of a query). Both
 survive restarts. To start either one clean, `./ct down` and delete its directory.
 
-A year is expected to land in 150–400 MB. That estimate is reasoned rather than measured
-— about 60% of every span is the same identity block repeated verbatim, which a columnar
-store collapses to almost nothing — so check it rather than trust it once there's a real
-year in there.
+A year of spans is expected to land in 150–400 MB. That estimate is reasoned rather than
+measured — about 60% of every span is the same identity block repeated verbatim, which a
+columnar store collapses to almost nothing — so check it rather than trust it once there's
+a real year in there.
+
+For events the same collapse has been measured, on 4,798 real records: 8.7 MiB as OTLP
+JSON, 580 KiB once in ClickHouse, a factor of 15. Those records came to ~1.9 KB each and
+~12.8 KB per tool call, and at the 41,341 tool calls a month this machine actually runs
+that is ~500 MB of JSON a month — so the file sink this replaced, capped at 64 MB across
+four backups, held about two weeks and then dropped the oldest data with no error and no
+log line. The same year compresses to under 400 MB in the table. Re-measure with:
+
+```bash
+./ct sql "SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows)
+          FROM system.parts WHERE database='claude' AND table='events' AND active"
+```
 
 Everything under `var/` is disposable and gitignored — binaries, pidfiles, logs, and
 storage all come back from `./ct up`.

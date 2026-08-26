@@ -209,6 +209,93 @@ startup_scripts:
         TTL toDateTime(Timestamp) + INTERVAL 1 YEAR
         SETTINGS ttl_only_drop_parts = 1
 
+    # --- events ----------------------------------------------------------
+    # The logs signal: user prompts, tool results, hook runs, skill activations,
+    # API errors. Spans say a tool call happened and how long it took; these say
+    # what was asked and what came back, and nothing else in the stack records
+    # api_error or api_retries_exhausted at all.
+    #
+    # This used to be a rotating file, and the measurement that moved it here is
+    # worth keeping next to the DDL: 4,798 records over 82 hours came to 9.1 MB,
+    # about 1.9 KB a record and 12.8 KB per tool call. At the 41,341 tool calls a
+    # month this machine actually runs, that is ~500 MB a month, against a file
+    # ceiling of 64 MB x 4 backups -- roughly two weeks before the oldest data
+    # went out with no error and no log line. The columnar store is also where
+    # that volume belongs: ~60% of every record is the same identity block
+    # (user.email, user.id, organization.id) repeated verbatim, which is nearly
+    # free once dictionary-encoded and is paid for in full in JSON.
+    #
+    # Columns down to EventName are the exporter's logs INSERT contract, captured
+    # by letting it create its own table and reading the result back, the same way
+    # and for the same reason as the spans table above. The eight
+    # __otel_materialized_k8s.* columns it also generates are omitted: they are
+    # MATERIALIZED, so the exporter cannot name them in an INSERT, and none of
+    # this runs in Kubernetes.
+    - query: |
+        CREATE TABLE IF NOT EXISTS claude.events
+        (
+          Timestamp          DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+          TraceId            String CODEC(ZSTD(1)),
+          SpanId             String CODEC(ZSTD(1)),
+          TraceFlags         UInt8,
+          SeverityText       LowCardinality(String) CODEC(ZSTD(1)),
+          SeverityNumber     UInt8,
+          ServiceName        LowCardinality(String) CODEC(ZSTD(1)),
+          Body               String CODEC(ZSTD(1)),
+          ResourceSchemaUrl  LowCardinality(String) CODEC(ZSTD(1)),
+          ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+          ScopeSchemaUrl     LowCardinality(String) CODEC(ZSTD(1)),
+          ScopeName          String CODEC(ZSTD(1)),
+          ScopeVersion       LowCardinality(String) CODEC(ZSTD(1)),
+          ScopeAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+          LogAttributes      Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+
+          -- OTLP's own field for this, and Claude Code leaves it empty on every
+          -- record -- 2.1.226 puts the event name in Body instead. Kept because
+          -- it is part of the INSERT contract above, not because it answers
+          -- anything: query Body for the event name, never this.
+          EventName          String CODEC(ZSTD(1)),
+
+          -- Promoted out of the maps for the same reasons as on spans: computed
+          -- once at insert, real columns that can lead the sort key, originals
+          -- left in place. SessionId is the one that matters -- it is the key
+          -- every join in this file already uses to reach spans, session_turns
+          -- and lit's ticket history, so an event and the span it happened
+          -- inside meet with no correlation and no time window.
+          SessionId          String MATERIALIZED LogAttributes['session.id'],
+
+          -- Stamped by `ct claude`, so sessions launched any other way have them
+          -- empty -- the same reading as on spans.
+          Repository         LowCardinality(String) MATERIALIZED ResourceAttributes['vcs.repository.name'],
+          Branch             LowCardinality(String) MATERIALIZED ResourceAttributes['vcs.ref.head.name'],
+
+          INDEX idx_log_attr_key   mapKeys(LogAttributes)        TYPE bloom_filter(0.01) GRANULARITY 1,
+          INDEX idx_log_attr_value mapValues(LogAttributes)      TYPE bloom_filter(0.01) GRANULARITY 1,
+          INDEX idx_res_attr_key   mapKeys(ResourceAttributes)   TYPE bloom_filter(0.01) GRANULARITY 1,
+          INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1
+        )
+        ENGINE = MergeTree
+
+        -- Monthly, matching spans, and against the exporter's own default of
+        -- daily -- which would stand up 365 partitions to answer twelve monthly
+        -- questions, and would make the TTL below evict a day at a time.
+        PARTITION BY toYYYYMM(Timestamp)
+
+        -- Body first because it holds the event name and every query starts by
+        -- naming one, exactly as SpanType leads the spans key; SessionId next so
+        -- "everything session X logged" stays a seek. The exporter's default
+        -- leads with toStartOfFiveMinutes(Timestamp) then ServiceName, and
+        -- ServiceName holds one value here, so as a sort key it sorts nothing.
+        ORDER BY (Body, SessionId, Timestamp)
+
+        -- The same year the spans get, stated the same way. The exporter creates
+        -- its logs table with no TTL at all, so inheriting its default would
+        -- have traded a ceiling that drops data early for one that never drops
+        -- it -- and left the two signals in one store disagreeing about how far
+        -- back "all of it" reaches. [LAW:one-source-of-truth]
+        TTL toDateTime(Timestamp) + INTERVAL 1 YEAR
+        SETTINGS ttl_only_drop_parts = 1
+
     # --- prices ---------------------------------------------------------
     # No span carries a cost. Claude Code emits dollars only on the metrics
     # signal, at session grain and onto a Prometheus scrape surface that forgets
