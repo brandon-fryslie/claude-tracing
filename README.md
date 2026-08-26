@@ -280,8 +280,9 @@ comes up.
 The components stay beside it — `InputCostUSD`, `CacheReadCostUSD`,
 `CacheCreationCostUSD`, `OutputCostUSD` — because "cache reads or output?" is the usual
 next question, and because each one's share of the bill is nothing like its share of the
-tokens. The cheapest component supplies almost all the tokens while the two dearest
-supply most of the bill, which is precisely the structure a single blended rate erases.
+tokens. The cheapest component supplies almost all the tokens and, through sheer volume,
+still most of the bill; the two dearest supply over a third of the bill from under a
+fortieth of the tokens. That disproportion is precisely what a single blended rate erases.
 Ask your own store rather than trusting a figure quoted here, because these move as data
 accumulates:
 
@@ -290,12 +291,18 @@ accumulates:
                  round(100*sum(CacheReadTokens)/nullIf(sum(TotalTokens), 0), 1)  AS cache_read_pct_tokens,
                  round(100*sum(OutputCostUSD)/nullIf(sum(CostUSD), 0), 1)        AS output_pct_spend,
                  round(100*sum(OutputTokens)/nullIf(sum(TotalTokens), 0), 1)     AS output_pct_tokens
-          FROM claude.llm_requests FORMAT Vertical"
+          FROM claude.llm_requests WHERE Priced FORMAT Vertical"
 ```
 
 Run before your first session, that answers `NULL` four times rather than erroring: the
 `nullIf` guards are there because dividing a `Decimal` by zero raises in ClickHouse, and a
 store with no priced requests yet is the state every fresh `./ct up` starts in.
+
+`WHERE Priced` is what keeps the two halves comparable. An unpriced request costs zero by
+construction but still carries its real token counts, so without it the spend shares would
+be computed over one population and the token shares over a larger one — and the gap
+between them, which is supposed to show a pricing structure, would partly just be missing
+rate rows.
 
 No span carries a cost, so these are derived — token counts times `claude.model_prices`,
 which is a rate table this repo owns and states in `config/clickhouse.yaml`. That has three

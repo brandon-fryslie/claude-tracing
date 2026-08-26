@@ -254,15 +254,21 @@ series the endpoint exposed, and each reproduced as closely as the counter can s
 itself — it is serialised as a float64, so one series reads `2.6423449999999997` where
 the true figure is `2.642345`, a 3×10⁻¹⁶ gap that is the counter's rounding rather than
 the table's error. Computed in decimal here, the derived figure is the more exact of the
-two. What the reconciliation returned **on that date**, per million tokens:
+two. The rates as of **that date**, per million tokens — every cell reconciled against the
+counter except the two marked †:
 
 | Model | Input | Cache read | Cache creation | Output |
 | --- | --- | --- | --- | --- |
 | `claude-opus-5[1m]` | $5.00 | $0.50 | $10.00 | $25.00 |
-| `claude-haiku-4-5-20251001` | $1.00 | $0.10 | $2.00 | $5.00 |
+| `claude-haiku-4-5-20251001` | $1.00 | $0.10 † | $2.00 † | $5.00 |
 
-That is a measurement, not a price list — frozen here the way every other figure in this
-document is frozen. The rates actually applied to queries live in
+† **Not reconciled.** No Haiku request in this store has ever touched the cache, so there
+was no series to solve these two against; they are Opus's published multipliers carried
+over. Every other cell above came back from the counter. The same distinction is recorded
+in the confidence table below.
+
+The six reconciled cells are a measurement, not a price list — frozen here the way every
+other figure in this document is frozen. The rates actually applied to queries live in
 `config/clickhouse.yaml`, which is the only file that governs billed dollars; if the two
 ever disagree, this table is the stale one and the script below is how to settle it.
 
@@ -437,6 +443,7 @@ getcontext().prec = 50
 # The rates under test. Copy these from config/clickhouse.yaml, then see if they hold.
 RATE = {
  'claude-opus-5[1m]':         dict(input='5.0', cacheRead='0.5', cacheCreation='10.0', output='25.0'),
+ 'claude-opus-5':             dict(input='5.0', cacheRead='0.5', cacheCreation='10.0', output='25.0'),
  'claude-haiku-4-5-20251001': dict(input='1.0', cacheRead='0.1', cacheCreation='2.0',  output='5.0'),
 }
 cost, toks = {}, collections.defaultdict(dict)
