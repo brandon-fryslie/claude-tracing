@@ -81,6 +81,23 @@ CT_CLICKHOUSE_PRICES_VIEW=model_prices
 # would need a sync command, and a sync command that nobody remembers to run is a
 # store that answers yesterday's question with today's confidence.
 CT_CLICKHOUSE_SCRIPTS_DIR="$CT_CLICKHOUSE_DATA_DIR/user_scripts"
+
+# The two below are NOT held true the same way, and the difference is worth
+# stating rather than leaving to look symmetrical.
+#
+# The directory is genuinely single-sourced: clickhouse.yaml's user_scripts_path
+# reads this exact variable through @from_env, so both sides cannot disagree
+# about where the script lives.
+#
+# The filename cannot be. It appears inside executable('lit_export.sh', ...),
+# and ClickHouse substitutes whole values, never substrings of a query -- the
+# same limitation that keeps claude.spans and the TTL written out in the DDL. So
+# config/clickhouse.yaml holds a second copy of this name, and renaming here
+# without renaming there would have `ct` write a script ClickHouse never looks
+# for. What holds the copy true is a check that fails loudly rather than trust,
+# exactly as with CT_CLICKHOUSE_TABLE: a mismatch means executable() finds
+# nothing, the view's border throws, and `ct verify`'s ticket assertions die
+# naming it. [LAW:one-source-of-truth]
 CT_LIT_EXPORT_SCRIPT=lit_export.sh
 
 # The lit workspace those tickets live in. One value, because ClickHouse is one

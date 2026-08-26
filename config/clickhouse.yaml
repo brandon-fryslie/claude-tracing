@@ -665,6 +665,20 @@ startup_scripts:
     # this store -- so an llm_request does not know its own turn number and the
     # span it belongs to is the one whose window contains it.
     #
+    # WHAT THIS VIEW DOES NOT COVER, since the omission is silent and costs
+    # money. A request that belongs to no interaction span falls inside no turn
+    # and so appears in no row here -- llm_requests carries a third population,
+    # RequestContext = 'standalone' (title generation and the like), which hangs
+    # off no parent. On the store this was written against that is 2 requests and
+    # $0.25 against a $88.27 total, so summing CostUSD here under-reports a
+    # session by exactly that much. claude.llm_requests is the authority for a
+    # session total; this view is the authority for a turn.
+    #
+    # A synthetic Turn = 0 bucket would make the two reconcile, and is
+    # deliberately not here: the grain of this view is a turn, and a row claiming
+    # to be a turn while not being one trades a documented gap for a misleading
+    # value. [LAW:one-type-per-behavior]
+    #
     # NEVER JOIN THESE BY TRACE ID. A `claude` launched from inside another
     # session's Bash tool call parents its root span to the caller's, so one
     # trace here holds three distinct sessions, and `ct verify` creates that
@@ -693,11 +707,27 @@ startup_scripts:
         WITH turn AS (
           SELECT
             SessionId,
-            InteractionSequence AS Turn,
-            toDateTime64(Timestamp, 9, 'UTC') AS Began,
-            Began + toIntervalNanosecond(Duration) AS Ended
-          FROM claude.spans
-          WHERE SpanType = 'interaction'
+            Turn,
+            min(Began) AS Began,
+            max(Ended) AS Ended
+          FROM (
+            SELECT
+              SessionId,
+              InteractionSequence AS Turn,
+              toDateTime64(Timestamp, 9, 'UTC') AS Began,
+              Began + toIntervalNanosecond(Duration) AS Ended
+            FROM claude.spans
+            WHERE SpanType = 'interaction'
+          )
+          -- One row per turn, guaranteed here rather than assumed. claude.spans
+          -- is a plain MergeTree with no dedup key and the collector retries
+          -- failed exports, so the same interaction span can arrive twice; the
+          -- store holds no such duplicate today, but nothing prevents one. A
+          -- duplicate would fan this CTE out against the per-turn aggregate it
+          -- joins, doubling that turn's requests, tokens and cost with no error
+          -- and no missing row. (SessionId, Turn) is unique for well-formed
+          -- data, so collapsing is the correct reading, not a lossy one.
+          GROUP BY SessionId, Turn
         )
         SELECT
           turn.SessionId       AS SessionId,
@@ -805,9 +835,19 @@ startup_scripts:
         FROM (
           SELECT
             Ticket,
+            -- The first claim ever, so a ticket abandoned and resumed reports
+            -- the total effort it took rather than only the last attempt.
             minIf(At, ToStatus = 'in_progress') AS Started,
             maxIf(At, ToStatus = 'closed')      AS Closed,
-            countIf(ToStatus = 'closed') > 0    AS Completed,
+            -- Completed asks what the ticket's status IS, not whether it was
+            -- ever closed. The difference is a reopened ticket: "has a close
+            -- ever happened" stays true forever, so it would be reported as
+            -- finished by every `WHERE Completed` query, and WorkedUntil would
+            -- pin to the stale close -- silently dropping every turn worked
+            -- after the reopen. Reading the last transition instead makes a
+            -- reopened ticket open again, which puts its window back on now()
+            -- and picks those turns up. [LAW:no-silent-failure]
+            argMaxIf(ToStatus, At, ToStatus != '') = 'closed' AS Completed,
             if(Completed, Closed, now64(9, 'UTC')) AS WorkedUntil
           FROM claude.ticket_events
           GROUP BY Ticket

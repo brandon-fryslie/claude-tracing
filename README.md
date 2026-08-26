@@ -367,6 +367,13 @@ comes back a large, plausible undercount rather than an obvious zero.
           GROUP BY Ticket ORDER BY min(Started) FORMAT PrettyCompact"
 ```
 
+**`lit` is a prerequisite this stack does not install.** It has to be on the `PATH` of the
+ClickHouse process, and its store lives in `.git/links` — so a fresh clone has no backlog
+until you `lit init`. The join answers for exactly one workspace, named by
+`CT_LIT_WORKSPACE` (default: this checkout); point it elsewhere and re-run `./ct up` to
+regenerate the bridge script. Without `lit`, everything else on this page works unchanged
+and `./ct verify` reports the ticket join as not checked rather than failing.
+
 This is the one question that reaches outside the span store, because it needs a fact no
 span can carry: whether the ticket was *finished*. A span is stamped when a session starts
 and never changes, so nothing in it could know about a close that happens hours later in a
@@ -391,9 +398,13 @@ incorrectly.
 
 The full definition, since the number is meaningless without it:
 
-- A ticket's window runs from its first move into `in_progress` to its last into `closed`.
-  A ticket is often not one session — `zbi.5` was started by one and closed by another two
-  days later — so the window, not the session, is the unit.
+- A ticket's window runs from its first move into `in_progress` to its last into `closed`,
+  or **to now if it hasn't closed** — an open ticket has been worked up to the present
+  moment, so it has a window and turns like any other. `Completed` is what separates the
+  two, and it reads the ticket's *latest* status rather than whether a close ever happened:
+  a ticket that was closed and reopened is open again, and the turns worked since the
+  reopen are counted. A ticket is often not one session — `zbi.5` was started by one and
+  closed by another two days later — so the window, not the session, is the unit.
 - Its sessions are the ones `lit` records *moving* it — claiming, closing, reopening — not
   every session that touched it. A grooming pass that re-ranks thirty tickets in one sitting
   would otherwise become a participant in all thirty and donate its turns to whichever
@@ -417,7 +428,12 @@ session's Bash tool call parents its root span to the caller's, so one trace in 
 holds three distinct sessions — and `ct verify` creates exactly that shape on every run.
 
 `claude.session_turns` sits underneath, one row per turn with its model, tokens and cost
-and no ticket attached, so "where did this session's tokens go" is answerable on its own.
+and no ticket attached, so "where did this *turn* go" is answerable on its own. It is not a
+session total: a request belonging to no turn — `RequestContext = 'standalone'`, title
+generation and the like — falls inside no window and so appears in no row, which on the
+store this was written against is $0.25 of an $88.27 total. `claude.llm_requests` is the
+authority for what a session cost; this view is the authority for what a turn cost.
+
 A turn's `Model` is the model that produced the most main-loop output in it, not the model
 of any one request: turns run subagents on other models and pick up background Haiku calls,
 so the question is about the weight of the work.

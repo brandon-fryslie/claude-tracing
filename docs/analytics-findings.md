@@ -316,7 +316,7 @@ two stores already shared a key; nothing had to be recorded to make the join pos
 noticed. That inverts the epic's usual perishability argument: this was the one piece that
 could be built retroactively, and it was.
 
-What the store holds, over the five completed tickets that have telemetry:
+What the store holds. Five tickets are completed; these are the four that have telemetry:
 
 | Ticket | Turns | Sessions | Model | Cost |
 | --- | --- | --- | --- | --- |
