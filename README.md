@@ -281,7 +281,7 @@ The components stay beside it — `InputCostUSD`, `CacheReadCostUSD`,
 `CacheCreationCostUSD`, `OutputCostUSD` — because "cache reads or output?" is the usual
 next question, and because each one's share of the bill is nothing like its share of the
 tokens. The cheapest component supplies almost all the tokens and, through sheer volume,
-still most of the bill; the two dearest supply over a third of the bill from under a
+still most of the bill; the two dearest supply more than a third of the bill from about a
 fortieth of the tokens. That disproportion is precisely what a single blended rate erases.
 Ask your own store rather than trusting a figure quoted here, because these move as data
 accumulates:
