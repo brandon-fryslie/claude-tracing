@@ -30,9 +30,10 @@ no git branch, no ticket, no notion of what the session was for.
 
 That gap sets the priority for everything else. Storage can be migrated; an attribute
 that was never emitted is gone. **What gets recorded is perishable. Where it's stored is
-not.** Every day without work-unit labels is another day that can never answer questions
-3 and 4, retroactively, forever — which is why the labelling ticket outranks the more
-interesting ClickHouse ticket.
+not.** Every day without work-unit labels is another day that can never answer question 4,
+retroactively, forever — which is why the labelling ticket outranks the more interesting
+ClickHouse ticket. Question 3 was on this list too, and turned out not to belong on it; the
+correction is two paragraphs down, and it is the more interesting half of the story.
 
 The fix was cheap, and as of 2026-08-23 it is in: `./ct claude` stamps
 `vcs.repository.name`, `vcs.ref.head.name`, and `process.working_directory` onto every
@@ -350,8 +351,9 @@ the wrong reason.
 
 One trap worth restating because it survives into any future query here: **a trace id is not
 a session key.** A `claude` launched from inside another session's Bash tool call parents its
-root span to the caller's, so one trace in this store holds three distinct session ids, and
-`ct verify` creates that shape on every run.
+root span to the caller's, so one trace in this store holds more than one session id — traces
+of five are on file. Running `ct verify` from inside a Claude Code session, as this repo's own
+development does, produces that shape; run from a plain shell it is one session like any other.
 
 ## Confidence: measured, derived, assumed
 

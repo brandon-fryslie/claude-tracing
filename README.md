@@ -377,8 +377,12 @@ comes back a large, plausible undercount rather than an obvious zero.
 ClickHouse process, and its store lives in `.git/links` — so a fresh clone has no backlog
 until you `lit init`. The join answers for exactly one workspace, named by
 `CT_LIT_WORKSPACE` (default: this checkout); point it elsewhere and re-run `./ct up` to
-regenerate the bridge script. Without `lit`, everything else on this page works unchanged
-and `./ct verify` reports the ticket join as not checked rather than failing.
+regenerate the bridge script — repointing the variable alone moves only what `./ct verify`
+probes, not what the query reads. Without `lit`, everything else on this page works unchanged
+and `./ct verify` reports the ticket join as not checked rather than failing. A `lit` that is
+installed and *fails* is the other case and does fail the run: a backlog that answered
+yesterday and errors today is a regression, not an absence, and the two are reported
+separately rather than both as "not checked".
 
 This is the one question that reaches outside the span store, because it needs a fact no
 span can carry: whether the ticket was *finished*. A span is stamped when a session starts
@@ -416,6 +420,12 @@ The full definition, since the number is meaningless without it:
   would otherwise become a participant in all thirty and donate its turns to whichever
   windows were open. That is a floor, not a census: a session that worked a ticket and never
   transitioned it leaves no trace and cannot be counted.
+- Each session's contribution is capped at the moment it **moved on** — its next transition on
+  a *different* ticket. So the window above is the ticket's bound, and this is a second one
+  laid on top of it per session: a session that claimed a ticket, wandered off to another and
+  never came back stops contributing when it left, not at `now()`. Moving the *same* ticket
+  again — reopening it, closing it a second time — is not moving on, and does not cap anything.
+  A session that never moved anything else is capped by the ticket's window alone.
 - Turns that invoked no model don't count. Every session on file ends with one or more
   sub-second turns — a slash command handled locally, an interrupted line — and counting
   them would inflate every ticket by one or two. They stay visible in
@@ -423,15 +433,26 @@ The full definition, since the number is meaningless without it:
 - `Completed` is carried so averages can exclude open tickets. Averaging over a ticket
   still being worked measures how far it has got, not what it took.
 
-Two ways this can still be wrong, both unfixable from here: two tickets open at once share
-their overlapping turns, because nothing records which one a turn was actually for; and a
-ticket whose sessions predate the recording has no turns at all. It is absent from the
-results rather than reported as zero — zero turns is an answer, and this is the absence of
-one.
+Ways this can still be wrong, none of them fixable from here, worst first:
+
+- A session that claims a ticket, never closes it, and **never touches another ticket** keeps
+  accruing to it. The cap above needs somewhere to have moved on *to*; when there is nowhere,
+  the window runs to `now()` and quietly collects that session's entire subsequent history.
+  This is the worst of the three because it needs only one forgotten ticket.
+- Two tickets open at once share their overlapping turns, because nothing records which one a
+  turn was actually for.
+- A session that worked a ticket without ever transitioning it is invisible, per the second
+  bullet above — its turns land on whatever else it did move, or nowhere.
+
+Not on that list, because it is the intended behaviour rather than a defect: a ticket whose
+sessions predate the recording has no turns at all, and is absent from the results rather
+than reported as zero. Zero turns is an answer; this is the absence of one.
 
 **Group by `SessionId`, never `TraceId`.** A `claude` launched from inside another
 session's Bash tool call parents its root span to the caller's, so one trace in this store
-holds three distinct sessions — and `ct verify` creates exactly that shape on every run.
+holds more than one session — traces of five are on file. Running `ct verify` from inside a
+Claude Code session, as this repo's own development does, produces that shape; run from a
+plain shell it is one session like any other.
 
 `claude.session_turns` sits underneath, one row per turn with its model, tokens and cost
 and no ticket attached, so "where did this *turn* go" is answerable on its own. It is not a
