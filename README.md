@@ -598,7 +598,7 @@ span event, truncated at 60 KB each. It makes traces large.
 
 ```bash
 ./ct status    # is each service running, and is it answering
-./ct logs      # tail both service logs
+./ct logs      # tail the log of every service that has started
 ./ct ui        # open Jaeger
 ./ct down      # stop
 ```

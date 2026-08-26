@@ -667,8 +667,45 @@ cmd_sql() {
     || ct_die "ClickHouse rejected the query, or is not up. Check: ./ct status"
 }
 
+# One row of ct_services() reduced to the log it writes.
+ct_service_logfile() { ct_logfile "$1"; }
+
+# The service logs that exist, in start order -- the set `ct logs` follows.
+#
+# [LAW:one-source-of-truth] The log set belongs to ct_services(): one row, one
+# log. A glob over $CT_LOG_DIR is a second, weaker representation of that same
+# set and drifts from it in both directions -- it would follow a stale file left
+# by a service the table no longer has, and on a checkout where var/ has never
+# been created it matches nothing at all.
+#
+# Filtered to files that already exist, because `tail -F` given a path that
+# shows up later attributes it to the wrong service. Measured on macOS
+# 2026-08-26: a line written to a not-yet-created b.log was printed under the
+# `==> a.log <==` header, with no header of its own. Following a log that has
+# not been written yet buys the up-in-progress case and pays for it by
+# mislabelling whatever it eventually catches.
+ct_started_logfiles() {
+  local log
+  while IFS= read -r log; do
+    [ -e "$log" ] || continue
+    printf '%s\n' "$log"
+  done < <(ct_for_each_service ct_service_logfile)
+}
+
+# [LAW:no-silent-failure] The empty set is decided here rather than handed to
+# tail, because tail's answer to it is silence. `tail -F` waits for a missing
+# file instead of complaining about it, so on a checkout that has never run
+# `ct up` -- var/ is gitignored, so there is no log dir at all -- the old glob
+# matched nothing, bash passed `*.log` through literally, and tail sat waiting
+# for a file by that name. Measured on macOS 2026-08-26: no output, no error, no
+# exit. `ct logs` is what someone runs when they are already confused about why
+# nothing works, and it answered them with a terminal that never came back.
 cmd_logs() {
-  tail -n 40 -F "$CT_LOG_DIR"/*.log
+  local -a logs
+  mapfile -t logs < <(ct_started_logfiles)
+  [ "${#logs[@]}" -gt 0 ] || ct_die "no service has written a log under $CT_LOG_DIR.
+  Nothing has been started in this checkout yet. Start the stack:  $CT_ROOT/ct up"
+  tail -n 40 -F "${logs[@]}"
 }
 
 cmd_ui() {
@@ -801,13 +838,34 @@ code review|session.purpose=code%20review
 EOF
 }
 
+# Which logs `ct logs` follows, given what is on disk. The first row is the
+# reported bug -- a checkout that has never run `ct up` -- and the stray row is
+# the reason the set comes from ct_services() rather than from a glob: a glob
+# would follow anything ending in .log, including a file no service in this
+# stack wrote. The last two rows pin start order against creation order, so the
+# reading order cannot come to depend on which service happened to launch first.
+#
+# Fields: files in the log dir|the logs followed, in order
+ct_logfile_cases() {
+  cat <<'EOF'
+|
+clickhouse.log|clickhouse.log
+stray.log|
+clickhouse.log,stray.log|clickhouse.log
+collector.log,clickhouse.log|clickhouse.log,collector.log
+jaeger.log,collector.log,clickhouse.log|clickhouse.log,jaeger.log,collector.log
+EOF
+}
+
 # Runs first because it is the cheapest stage and nothing downstream means
 # anything if it fails. Cheapest is not free: measured at 3.9-4.1s over five
 # runs, of which all but a fraction is two fixtures being watched for a bounded
 # interval to prove a process is STILL THERE -- an observation that cannot be
-# hurried, only skipped. Every other check here costs milliseconds, which is why
-# adding them changed the total by nothing measurable. Compare the minute a full
-# run spends on stages 2 to 4.
+# hurried, only skipped. Every other check here costs milliseconds, or a fraction
+# of a second where it has to fork once per case as the log-set table does, which
+# is why adding them changed the total by nothing measurable: with and without
+# the log checks, interleaved over five pairs, the difference stayed inside the
+# run-to-run spread. Compare the minute a full run spends on stages 2 to 4.
 #
 # Everything under it decides something before a byte leaves the host:
 # what a session is labelled, whether a daemon may launch, whether a stopped
@@ -817,6 +875,7 @@ verify_pure() {
   ct_info "stage 1/4: local logic (no network, no stack)"
   verify_label_encoding
   verify_config_env_guard
+  verify_service_logs
   verify_process_liveness
   verify_start_service_record
   verify_stop_service_record
@@ -914,6 +973,69 @@ verify_config_env_guard() {
   done < <(ct_export_cases)
 
   ct_ok "  the config-env guard reads both spellings and can tell exported from set"
+}
+
+# The two decisions `ct logs` makes before it follows anything: which logs
+# belong to this stack, and what to do when none of them exist yet.
+#
+# [LAW:behavior-not-structure] The rows say which files a run follows given
+# which files are on disk. An implementation that stopped using
+# ct_for_each_service would pass them unchanged; one that went back to globbing
+# $CT_LOG_DIR would fail the stray row and the empty one.
+verify_service_logs() {
+  local present expected root dir file actual row=0 status
+  local -a files
+
+  root="$(mktemp -d)"
+  [ -d "$root" ] || ct_die "mktemp -d produced no directory"
+
+  # A fresh directory per row rather than one emptied between rows, because
+  # emptying it means globbing it, and a glob that matches nothing is the bug
+  # under test.
+  #
+  # The paths come back and are trimmed in-shell rather than through sed and
+  # paste. That is not tidiness: this host forks at roughly 40ms, measured, so
+  # the two-process pipeline this replaces cost more than every other assertion
+  # in stage 1 put together.
+  while IFS='|' read -r present expected; do
+    dir="$root/$((row++))"
+    mkdir -p "$dir"
+    IFS=',' read -r -a files <<<"$present"
+    for file in "${files[@]}"; do
+      [ -n "$file" ] || continue
+      : > "$dir/$file"
+    done
+    actual="$(CT_LOG_DIR="$dir" ct_started_logfiles)"
+    actual="${actual//"$dir/"/}"
+    actual="${actual//$'\n'/,}"
+    [ "$actual" = "$expected" ] || {
+      rm -rf "$root"
+      ct_die "with '$present' in the log dir, ct logs would follow '$actual', expected '$expected'"
+    }
+  done < <(ct_logfile_cases)
+
+  # The residue on top of the list: an empty set has to become a message and a
+  # non-zero exit, and before either of those it has to RETURN. The bug this
+  # replaces did not, so the check is bounded -- a regression that hangs fails
+  # here instead of hanging the verify that exists to catch it. The bound is
+  # only ever spent on a failure; a passing run leaves it the moment ct_die does.
+  #
+  # Its own directory, not the empty row's above, so the assertion does not
+  # quietly depend on which row the table happens to start with.
+  dir="$root/none"
+  mkdir -p "$dir"
+  status=0
+  ( CT_LOG_DIR="$dir"; ct_run_bounded 5 cmd_logs ) >/dev/null 2>&1 </dev/null || status=$?
+  rm -rf "$root"
+
+  [ "$status" -ne 124 ] || ct_die "ct logs did not return within 5s over an empty log dir.
+  That is the original bug: tail -F waits for a file that is not there rather
+  than complaining about it, so the command never comes back."
+  [ "$status" -eq 1 ] || ct_die "ct logs exited $status over an empty log dir, expected 1.
+  With nothing started there is nothing to follow, and saying so is the whole job."
+
+  ct_ok "  ct logs follows this stack's own logs in start order, and says so"
+  ct_ok "  rather than hanging when nothing has started"
 }
 
 # Everything below rests on this one question, so it is asked first and asked as
