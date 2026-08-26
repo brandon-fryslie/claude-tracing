@@ -38,14 +38,14 @@ CT_CLICKHOUSE_DATA_DIR="$CT_VAR_DIR/clickhouse"
 CT_CLICKHOUSE_DATABASE=claude
 CT_CLICKHOUSE_TABLE=spans
 
-# Events (prompts, tool results, hook runs, API errors) land beside the spans
-# rather than in a rotating file, and the reason is retention arithmetic. The
-# file exporter this replaced kept 64 MB x 4 backups; events were measured at
-# roughly 12.8 KB per tool call, which against this machine's 41,341 tool calls
-# a month is ~500 MB a month -- so that ceiling held about two weeks and then
-# dropped the oldest data with no error and no log line. [LAW:no-silent-failure]
+# Events (hook runs, skill activations, API errors, and more) land beside the
+# spans rather than in a rotating file. The measured arithmetic that decided
+# that is stated once, in the events table's comment in config/clickhouse.yaml,
+# and deliberately not repeated here -- the short version is that the file
+# ceiling held about two weeks and then dropped the oldest data with no error
+# and no log line. [LAW:no-silent-failure]
 #
-# Sharing the store means sharing the retention authority: this table states the
+# Sharing the store means sharing the retention authority: that table states the
 # same one-year TTL as spans, so "how far back does my data go" has one answer
 # for both signals instead of a TTL for one and a rotation count for the other.
 # [LAW:one-source-of-truth]

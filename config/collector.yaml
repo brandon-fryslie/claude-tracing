@@ -71,9 +71,9 @@ service:
       exporters: [prometheus]
     # Events go to the same store as the spans, and so inherit the same one-year
     # TTL rather than carrying a rotation count of their own. The file exporter
-    # this replaced capped them at 64 MB x 4 backups, which measured out to about
-    # two weeks before the oldest data was dropped with no error and no log line;
-    # config/clickhouse.yaml's events table carries the arithmetic.
+    # this replaced measured out to about two weeks before it dropped the oldest
+    # data with no error and no log line; the arithmetic behind that lives once,
+    # in the events table's comment in config/clickhouse.yaml.
     logs:
       receivers: [otlp]
       processors: [batch]

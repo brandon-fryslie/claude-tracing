@@ -210,20 +210,35 @@ startup_scripts:
         SETTINGS ttl_only_drop_parts = 1
 
     # --- events ----------------------------------------------------------
-    # The logs signal: user prompts, tool results, hook runs, skill activations,
-    # API errors. Spans say a tool call happened and how long it took; these say
-    # what was asked and what came back, and nothing else in the stack records
-    # api_error or api_retries_exhausted at all.
+    # The logs signal. Some of it restates what spans already carry -- the prompt
+    # text is a `user_prompt` attribute on the interaction span, so read it there
+    # -- and some of it has no span at all: api_error, api_retries_exhausted,
+    # hook executions, plugin and MCP loads, skill activations, subagent
+    # completions. That second list is why deleting this pipeline was the wrong
+    # answer to the retention question below.
     #
-    # This used to be a rotating file, and the measurement that moved it here is
-    # worth keeping next to the DDL: 4,798 records over 82 hours came to 9.1 MB,
-    # about 1.9 KB a record and 12.8 KB per tool call. At the 41,341 tool calls a
-    # month this machine actually runs, that is ~500 MB a month, against a file
-    # ceiling of 64 MB x 4 backups -- roughly two weeks before the oldest data
-    # went out with no error and no log line. The columnar store is also where
-    # that volume belongs: ~60% of every record is the same identity block
-    # (user.email, user.id, organization.id) repeated verbatim, which is nearly
-    # free once dictionary-encoded and is paid for in full in JSON.
+    # THE CANONICAL RETENTION ARITHMETIC. Stated once, here, next to the table it
+    # justifies; lib/common.sh, config/collector.yaml and the README point at
+    # this block rather than restating it, because four copies of one derivation
+    # are four chances to correct one and leave three lying.
+    # [LAW:one-source-of-truth]
+    #
+    #   measured   4,798 records over 82.2 h = 9,100,461 bytes of OTLP JSON
+    #              ~1.9 KB a record, ~12.8 KB per tool call
+    #   scaled     41,341 tool calls a month (the epic's measured baseline)
+    #              -> ~500 MB of JSON a month
+    #   the file   max_megabytes 64, max_backups 3 -- the active file plus three
+    #              backups, so 256 MB total, or ABOUT TWO WEEKS, after which the
+    #              oldest went out with no error and no log line
+    #   here       the same 4,798 records occupy 580 KiB on disk, a factor of 15,
+    #              putting a year under 400 MB
+    #
+    # The factor of 15 is not luck: ~60% of every record is the same identity
+    # block (user.email, user.id, organization.id) repeated verbatim, which is
+    # nearly free once dictionary-encoded and is paid for in full in JSON.
+    # Re-derive the last line with:
+    #   SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows)
+    #   FROM system.parts WHERE database='claude' AND table='events' AND active
     #
     # Columns down to EventName are the exporter's logs INSERT contract, captured
     # by letting it create its own table and reading the result back, the same way
@@ -258,10 +273,17 @@ startup_scripts:
 
           -- Promoted out of the maps for the same reasons as on spans: computed
           -- once at insert, real columns that can lead the sort key, originals
-          -- left in place. SessionId is the one that matters -- it is the key
-          -- every join in this file already uses to reach spans, session_turns
-          -- and lit's ticket history, so an event and the span it happened
-          -- inside meet with no correlation and no time window.
+          -- left in place. SessionId is the session-grain key -- the one every
+          -- join in this file already uses to reach spans, session_turns and
+          -- lit's ticket history.
+          --
+          -- It is NOT how you find the span an event fired inside: a session
+          -- holds thousands of spans, so an equi-join on SessionId alone is a
+          -- cross product. Use the SpanId column above for that -- it comes
+          -- straight from OTLP and Claude Code populates it on the events that
+          -- matter (tool_decision, tool_result, api_request: >99% non-empty on
+          -- this machine's data), so `events.SpanId = spans.SpanId` is the
+          -- per-event match and needs no time window.
           SessionId          String MATERIALIZED LogAttributes['session.id'],
 
           -- Stamped by `ct claude`, so sessions launched any other way have them

@@ -144,10 +144,15 @@ breaks, viewing still works, and the reverse.
 
 Logs — Claude Code calls them events — go to ClickHouse rather than to a file, and they
 land beside the spans so both signals expire on one clause instead of a TTL for one and a
-rotation count for the other. `claude.events` carries what `claude.spans` cannot: the
-prompt text, the tool result, every hook run, and `api_error` / `api_retries_exhausted`,
-which nothing else in the stack records. Both tables materialize `SessionId`, so an event
-and the span it happened inside join with no correlation and no time window.
+rotation count for the other. Some of what `claude.events` holds also lives on the spans
+(prompt text is a `user_prompt` attribute on the interaction span, so read it there), and
+some has no span at all: `api_error`, `api_retries_exhausted`, hook executions, plugin and
+MCP loads, skill activations, subagent completions.
+
+To go from an event to the span it fired inside, join on `SpanId` — Claude Code populates
+it on the events that matter. `SessionId` is the session-grain key both tables materialize;
+joining on it alone gives every event against every span in the session, which is a cross
+product, not a match.
 
 Jaeger 2.20 does ship its own ClickHouse backend, and this deliberately doesn't use it —
 the binary prints `WARNING: ClickHouse Storage is Experimental` on the way up, and
@@ -537,12 +542,12 @@ measured — about 60% of every span is the same identity block repeated verbati
 columnar store collapses to almost nothing — so check it rather than trust it once there's
 a real year in there.
 
-For events the same collapse has been measured, on 4,798 real records: 8.7 MiB as OTLP
-JSON, 580 KiB once in ClickHouse, a factor of 15. Those records came to ~1.9 KB each and
-~12.8 KB per tool call, and at the 41,341 tool calls a month this machine actually runs
-that is ~500 MB of JSON a month — so the file sink this replaced, capped at 64 MB across
-four backups, held about two weeks and then dropped the oldest data with no error and no
-log line. The same year compresses to under 400 MB in the table. Re-measure with:
+For events the same collapse has been measured rather than reasoned, and the outcome is
+that the file sink this replaced held **about two weeks** — not a year — before dropping
+the oldest data with no error and no log line, while the same year fits in **under 400 MB**
+as a table. The arithmetic behind both numbers is stated once, in the `claude.events`
+comment in `config/clickhouse.yaml`; it is not repeated here, so re-measuring only ever
+has one place to correct. Re-measure with:
 
 ```bash
 ./ct sql "SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows)

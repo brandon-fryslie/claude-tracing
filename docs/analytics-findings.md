@@ -157,7 +157,10 @@ claude ──▶ collector ─┬─▶ jaeger + badger    7 days   viewing (wor
 ```
 
 The collector already fans signals out — traces to Jaeger, metrics to Prometheus, logs to
-a file — so this adds an exporter rather than rewiring anything.
+a file — so this adds an exporter rather than rewiring anything. (The logs leg has since
+moved: measuring it showed the file ceiling held about two weeks, so events went to
+ClickHouse too, on the same one-year TTL. The arithmetic is in the `claude.events` comment
+in `config/clickhouse.yaml`. See `claude-analytics-zbi.7`.)
 
 **Jaeger deliberately does not sit on ClickHouse.** Jaeger 2.20 ships a ClickHouse backend,
 but the binary prints `WARNING: ClickHouse Storage is Experimental`, and there's no reason
