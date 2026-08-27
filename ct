@@ -1054,8 +1054,14 @@ verify_service_logs() {
     dir="$root/$((row++))"
     mkdir -p "$dir"
     IFS=',' read -r -a files <<<"$present"
-    for file in "${files[@]}"; do
-      [ -n "$file" ] || continue
+    # ${a[@]+"${a[@]}"} rather than "${a[@]}": under set -u, bash before 4.4
+    # calls an EMPTY array an unbound variable, and the first row of the table
+    # has an empty column, so stock macOS /bin/bash (3.2) would die here. It
+    # already dies earlier -- verify_label_encoding's multibyte row is a bash-4
+    # dependency and runs first, which is claude-portability-b3w -- so this is a
+    # trap being removed rather than a break being fixed, and it stops this line
+    # from becoming the next blocker the day that ticket is closed.
+    for file in ${files[@]+"${files[@]}"}; do
       : > "$dir/$file"
     done
 
@@ -1096,11 +1102,20 @@ verify_service_logs() {
   # The partial set: one log written, two services still silent.
   #
   # `tail` is shadowed for this one call, and that is what keeps the assertion
-  # to microseconds. tail -F has no ending of its own, so watching a real follow
-  # means killing it and paying a bound for the privilege -- measured at 1.2s,
-  # a third of this whole stage, to observe something that happens instantly.
-  # The empty-dir case below runs the REAL tail, because there the entire
-  # question is whether it ever comes back.
+  # to microseconds. tail -F has no ending of its own, so watching a REAL follow
+  # means killing it and paying for the wait -- measured at 1.2s, a third of this
+  # whole stage, to observe something that happens instantly. The empty-dir case
+  # below still runs the real tail, because there the entire question is whether
+  # it ever comes back.
+  #
+  # Bounded anyway, and the two are not the same cost: 1.2s was the price of
+  # watching a follow and killing it, where the bound is always spent. A bound
+  # that is never reached is free -- ct_run_bounded returns the instant its
+  # worker does. It is here because a shell function only shadows a BARE
+  # invocation: write `command tail`, or reach the binary through a variable,
+  # and the stub is bypassed and this check follows a real log forever. That is
+  # the same hang the case below is bounded against, and an unbounded check
+  # cannot report it -- it becomes it.
   #
   # The stub ECHOES its argv rather than swallowing it, and that is the whole
   # point of it. A stub that discarded its arguments observed only that cmd_logs
@@ -1112,8 +1127,8 @@ verify_service_logs() {
   mkdir -p "$dir"
   : > "$dir/clickhouse.log"
   local partial_status=0 partial_complaint partial_argv errfile="$root/partial.err"
-  partial_argv="$( ( CT_LOG_DIR="$dir"; tail() { printf '%s\n' "$@"; }; cmd_logs ) \
-                   2>"$errfile" </dev/null )" || partial_status=$?
+  partial_argv="$( ( CT_LOG_DIR="$dir"; tail() { printf '%s\n' "$@"; }
+                     ct_run_bounded 5 cmd_logs ) 2>"$errfile" </dev/null )" || partial_status=$?
   partial_complaint="$(<"$errfile")"
 
   dir="$root/none"
@@ -1143,7 +1158,10 @@ verify_service_logs() {
   confused, and a silent refusal leaves them exactly where they were." ;;
   esac
 
-  [ "$partial_status" -eq 0 ] || ct_die "with one log written of three, ct logs exited
+  [ "$partial_status" -ne 124 ] || ct_die "with one log on disk of three, ct logs never
+  returned. The stub that stands in for tail here only shadows a bare call, so the
+  likely cause is a follow that reached the real binary."
+  [ "$partial_status" -eq 0 ] || ct_die "with one log on disk of three, ct logs exited
   $partial_status instead of following what it had. A partial set is something to
   follow with a caveat, never something to refuse."
   case "$partial_complaint" in
@@ -1164,8 +1182,15 @@ verify_service_logs() {
   # for one is ours, and this row is the half we own. It is asserted on the ONE
   # log case because that is the case BSD tail labels only when told to, and the
   # case a half-started stack produces.
-  case "$partial_argv" in
-    *-v*) ;;
+  #
+  # Matched as a whole LINE, not as a substring of the argv blob. `-v` is two
+  # characters that occur in ordinary paths -- /home/dev-vm/tmp contains one,
+  # measured -- and the blob carries this run's mktemp path, so a substring test
+  # would pass on such a host no matter what cmd_logs did, and the mutation that
+  # drops -v would survive on exactly the machines nobody checks. The stub prints
+  # one argument per line, which is what makes the line the right unit.
+  case $'\n'"$partial_argv"$'\n' in
+    *$'\n'-v$'\n'*) ;;
     *) ct_die "ct logs followed a single log without asking tail to name it.
   It passed: $partial_argv
   Unlabelled, one log reads as the whole stack to someone who does not know two
