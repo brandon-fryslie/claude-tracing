@@ -8,7 +8,7 @@
 #   ./ct env       print the exports that make Claude Code emit spans
 #   ./ct verify    prove end to end that a Claude session reaches every sink
 #   ./ct status    what is running, and is it answering
-#   ./ct logs      tail the service logs
+#   ./ct logs      tail the log of every service that has started
 #   ./ct ui        open the Jaeger UI
 #   ./ct down      stop the stack
 
@@ -692,6 +692,22 @@ ct_started_logfiles() {
   done < <(ct_for_each_service ct_service_logfile)
 }
 
+# The complement: services this stack has that have written nothing.
+#
+# It exists because the empty set is not the only silence worth breaking.
+# ct_start_service dies on a missing binary and on ct_assert_config_env BEFORE
+# the redirect that creates the log, so a `ct up` that gets clickhouse running
+# and then aborts leaves exactly one log on disk. Following it alone, with no
+# word about the other two, hands the operator a plausible tail -- and this is
+# written for the operator who is already confused. [LAW:no-silent-failure]
+ct_absent_logfiles() {
+  local log
+  while IFS= read -r log; do
+    [ -e "$log" ] && continue
+    printf '%s\n' "$log"
+  done < <(ct_for_each_service ct_service_logfile)
+}
+
 # [LAW:no-silent-failure] The empty set is decided here rather than handed to
 # tail, because tail's answer to it is silence. `tail -F` waits for a missing
 # file instead of complaining about it, so on a checkout that has never run
@@ -701,10 +717,21 @@ ct_started_logfiles() {
 # exit. `ct logs` is what someone runs when they are already confused about why
 # nothing works, and it answered them with a terminal that never came back.
 cmd_logs() {
-  local -a logs
+  local -a logs absent
   mapfile -t logs < <(ct_started_logfiles)
-  [ "${#logs[@]}" -gt 0 ] || ct_die "no service has written a log under $CT_LOG_DIR.
-  Nothing has been started in this checkout yet. Start the stack:  $CT_ROOT/ct up"
+  mapfile -t absent < <(ct_absent_logfiles)
+
+  # What is reported is what was observed -- an absent log -- and never a cause
+  # inferred from it. The record of what is running is the pidfile, which
+  # ./ct status reads and this does not: clear var/log on a healthy stack and a
+  # message claiming nothing had been started would send the operator to `ct up`
+  # to be told three times that it is already running.
+  [ "${#logs[@]}" -gt 0 ] || ct_die "no service has written a log under $CT_LOG_DIR,
+  so there is nothing to follow. If you expect the stack to be up, ./ct status is
+  the authority on that -- these files are not. Otherwise:  $CT_ROOT/ct up"
+
+  [ "${#absent[@]}" -eq 0 ] \
+    || ct_warn "no log yet, so not followed: ${absent[*]##*/}"
   tail -n 40 -F "${logs[@]}"
 }
 
@@ -845,15 +872,20 @@ EOF
 # stack wrote. The last two rows pin start order against creation order, so the
 # reading order cannot come to depend on which service happened to launch first.
 #
-# Fields: files in the log dir|the logs followed, in order
+# The third column is the complement of the second, and it is a column rather
+# than an assumption because the two are read by different code: what gets
+# followed, and what gets named as not followed. A row where they disagree is a
+# service that has silently fallen out of both.
+#
+# Fields: files in the log dir|the logs followed, in order|the logs named absent
 ct_logfile_cases() {
   cat <<'EOF'
-|
-clickhouse.log|clickhouse.log
-stray.log|
-clickhouse.log,stray.log|clickhouse.log
-collector.log,clickhouse.log|clickhouse.log,collector.log
-jaeger.log,collector.log,clickhouse.log|clickhouse.log,jaeger.log,collector.log
+||clickhouse.log,jaeger.log,collector.log
+clickhouse.log|clickhouse.log|jaeger.log,collector.log
+stray.log||clickhouse.log,jaeger.log,collector.log
+clickhouse.log,stray.log|clickhouse.log|jaeger.log,collector.log
+collector.log,clickhouse.log|clickhouse.log,collector.log|jaeger.log
+jaeger.log,collector.log,clickhouse.log|clickhouse.log,jaeger.log,collector.log|
 EOF
 }
 
@@ -982,7 +1014,7 @@ verify_config_env_guard() {
 # ct_for_each_service would pass them unchanged; one that went back to globbing
 # $CT_LOG_DIR would fail the stray row and the empty one.
 verify_service_logs() {
-  local present expected root dir file actual row=0 status
+  local present followed unwritten root dir file actual row=0 status complaint
   local -a files
 
   root="$(mktemp -d)"
@@ -991,7 +1023,7 @@ verify_service_logs() {
   # A fresh directory per row rather than one emptied between rows, because
   # emptying it means globbing it, and a glob that matches nothing is the bug
   # under test.
-  while IFS='|' read -r present expected; do
+  while IFS='|' read -r present followed unwritten; do
     dir="$root/$((row++))"
     mkdir -p "$dir"
     IFS=',' read -r -a files <<<"$present"
@@ -999,12 +1031,21 @@ verify_service_logs() {
       [ -n "$file" ] || continue
       : > "$dir/$file"
     done
+
     actual="$(CT_LOG_DIR="$dir" ct_started_logfiles)"
-    actual="${actual//"$dir/"/}"
-    actual="${actual//$'\n'/,}"
-    [ "$actual" = "$expected" ] || {
+    actual="${actual//"$dir/"/}"; actual="${actual//$'\n'/,}"
+    [ "$actual" = "$followed" ] || {
       rm -rf "$root"
-      ct_die "with '$present' in the log dir, ct logs would follow '$actual', expected '$expected'"
+      ct_die "with '$present' in the log dir, ct logs would follow '$actual', expected '$followed'"
+    }
+
+    actual="$(CT_LOG_DIR="$dir" ct_absent_logfiles)"
+    actual="${actual//"$dir/"/}"; actual="${actual//$'\n'/,}"
+    [ "$actual" = "$unwritten" ] || {
+      rm -rf "$root"
+      ct_die "with '$present' in the log dir, ct logs would report '$actual' as unwritten, expected '$unwritten'.
+  A service missing from both this and the followed set is one that vanished
+  without anybody being told."
     }
   done < <(ct_logfile_cases)
 
@@ -1016,20 +1057,65 @@ verify_service_logs() {
   #
   # Its own directory, not the empty row's above, so the assertion does not
   # quietly depend on which row the table happens to start with.
+  # The partial set: one log written, two services still silent.
+  #
+  # `tail` is shadowed for this one call, and that is what keeps the assertion
+  # to microseconds. tail -F has no ending of its own, so watching a real follow
+  # means killing it and paying a bound for the privilege -- measured at 1.2s,
+  # a third of this whole stage, to observe something that happens instantly.
+  # The stub returns where the real tail would block, so a clean exit here says
+  # cmd_logs reached the follow instead of refusing a set it should have
+  # followed: the same fact the kill would have proved, deterministically.
+  # The empty-dir case below runs the REAL tail, because there the entire
+  # question is whether it ever comes back.
+  dir="$root/partial"
+  mkdir -p "$dir"
+  : > "$dir/clickhouse.log"
+  local partial_status=0 partial_complaint
+  partial_complaint="$( ( CT_LOG_DIR="$dir"; tail() { :; }; cmd_logs ) 2>&1 >/dev/null </dev/null )" \
+    || partial_status=$?
+
   dir="$root/none"
   mkdir -p "$dir"
   status=0
-  ( CT_LOG_DIR="$dir"; ct_run_bounded 5 cmd_logs ) >/dev/null 2>&1 </dev/null || status=$?
+  # stderr is CAPTURED, not discarded, because the status alone cannot tell
+  # a refusal that explains itself from one that does not. Exit 1 is what
+  # ct_die produces AND what a bare `return 1` produces: swap one for the other
+  # and a status-only assertion still prints "and says so" over a command that
+  # said nothing. Measured -- that mutation passed the earlier version of this
+  # check. What is followed is on stdout and irrelevant here, so it goes to
+  # /dev/null and the complaint takes the pipe.
+  complaint="$( ( CT_LOG_DIR="$dir"; ct_run_bounded 5 cmd_logs ) 2>&1 >/dev/null </dev/null )" \
+    || status=$?
   rm -rf "$root"
 
   [ "$status" -ne 124 ] || ct_die "ct logs did not return within 5s over an empty log dir.
   That is the original bug: tail -F waits for a file that is not there rather
   than complaining about it, so the command never comes back."
   [ "$status" -eq 1 ] || ct_die "ct logs exited $status over an empty log dir, expected 1.
-  With nothing started there is nothing to follow, and saying so is the whole job."
+  With nothing started there is nothing to follow, and failing is half the job."
+  case "$complaint" in
+    *"$dir"*) ;;
+    *) ct_die "ct logs refused an empty log dir without naming it. It said:
+  ${complaint:-(nothing at all)}
+  Returning non-zero is half the job; the operator who ran this is already
+  confused, and a silent refusal leaves them exactly where they were." ;;
+  esac
 
-  ct_ok "  ct logs follows this stack's own logs in start order, and says so"
-  ct_ok "  rather than hanging when nothing has started"
+  [ "$partial_status" -eq 0 ] || ct_die "with one log written of three, ct logs exited
+  $partial_status instead of following what it had. A partial set is something to
+  follow with a caveat, never something to refuse."
+  case "$partial_complaint" in
+    *jaeger.log*collector.log*) ;;
+    *) ct_die "ct logs followed clickhouse.log alone and never named the two services
+  that had written nothing. It said:
+  ${partial_complaint:-(nothing at all)}
+  A single plausible-looking tail is exactly what the confused operator this is
+  written for would misread as the whole picture." ;;
+  esac
+
+  ct_ok "  ct logs follows this stack's own logs in start order, names the ones"
+  ct_ok "  that have written nothing, and refuses out loud when none have"
 }
 
 # Everything below rests on this one question, so it is asked first and asked as
