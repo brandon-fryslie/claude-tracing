@@ -935,15 +935,13 @@ EOF
 }
 
 # Runs first because it is the cheapest stage and nothing downstream means
-# anything if it fails. Cheapest is not free: measured at 4.0-4.1s over five
+# anything if it fails. Cheapest is not free: measured at 3.6-4.2s over five
 # runs, of which all but a fraction is two fixtures being watched for a bounded
 # interval to prove a process is STILL THERE -- an observation that cannot be
-# hurried, only skipped. Everything else here decides rather than watches, and
-# costs a tenth of a second or two: the log checks add 0.21s, measured
-# interleaved against the same stage without them, five pairs on a quiet host.
-# Take those numbers only from a quiet host -- the same pair measured 4.7s and
-# 11s while this machine was busy, which says nothing about either build.
-# Compare the minute a full run spends on stages 2 to 4.
+# hurried, only skipped. Every other check here costs around a tenth of a second,
+# which is why adding one moves the total by less than the spread between runs:
+# measured interleaved, five pairs, against the same stage without the log
+# checks. Compare the minute a full run spends on stages 2 to 4.
 #
 # Everything under it decides something before a byte leaves the host:
 # what a session is labelled, whether a daemon may launch, whether a stopped
@@ -2286,24 +2284,3 @@ cmd_verify() {
   ct_trace "./ct sql \"SELECT round(sumIf(CostUSD, ServesToolCall), 2) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
 }
 
-# --- dispatch ---------------------------------------------------------------
-
-# The header block is the only copy of the command list; usage reads it back
-# rather than restating it. Ending the range at the first blank line, instead of
-# a line number, is what keeps that true when a command is added.
-usage() {
-  sed -n '3,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-}
-
-case "${1:-}" in
-  up)     cmd_up ;;
-  down)   cmd_down ;;
-  status) cmd_status ;;
-  logs)   cmd_logs ;;
-  ui)     cmd_ui ;;
-  env)    cmd_env ;;
-  verify) cmd_verify ;;
-  sql)    shift; cmd_sql "$@" ;;
-  claude) shift; cmd_claude "$@" ;;
-  *)      usage; exit 1 ;;
-esac

@@ -737,47 +737,7 @@ ct_partition_logfiles() {
 # exit. `ct logs` is what someone runs when they are already confused about why
 # nothing works, and it answered them with a terminal that never came back.
 cmd_logs() {
-  local -a logs=() missing=()
-  local side log rows
-  # Captured for the same reason the partition captures its own input, and it
-  # has to be done at BOTH ends: a ct_die inside a process substitution exits
-  # only that subshell, so reading the partition through `< <( )` would turn its
-  # loud death back into a short list and undo the guard one line above.
-  rows="$(ct_partition_logfiles)" \
-    || ct_die "could not work out which logs to follow; see above"
-  while IFS='|' read -r side log; do
-    case "$side" in
-      followed) logs+=("$log") ;;
-      missing)  missing+=("$log") ;;
-      *) ct_die "ct_partition_logfiles emitted a side nothing here knows: '$side'" ;;
-    esac
-  done <<<"$rows"
-
-  # Both messages report what was OBSERVED -- a log that is not on disk -- and
-  # never a cause inferred from it. The record of what is running is the pidfile,
-  # which ./ct status reads and this does not. Say "nothing has started" and
-  # clearing var/log on a healthy stack sends the operator to `ct up` to be told
-  # three times that it is already running; say "no log yet" and `rm
-  # var/log/jaeger.log` says it about a jaeger still writing to the unlinked
-  # inode. Neither file answers the question, so neither message asks it.
-  [ "${#logs[@]}" -gt 0 ] || ct_die "no service has written a log under $CT_LOG_DIR,
-  so there is nothing to follow. If you expect the stack to be up, ./ct status is
-  the authority on that -- these files are not. Otherwise:  $CT_ROOT/ct up"
-
-  [ "${#missing[@]}" -eq 0 ] \
-    || ct_warn "no log on disk, so not followed: ${missing[*]##*/}"
-
-  # -v, so every followed log is labelled whatever the count. Without it BSD
-  # tail prints the `==> file <==` header only when given MORE THAN ONE file,
-  # which makes the labelling an accident of how many logs happen to exist --
-  # and the one case this command exists to be honest about, a `ct up` that
-  # aborted after clickhouse, is exactly the one file case. Measured: a lone log
-  # comes out as a bare stream with nothing naming it. The caveat above rides on
-  # stderr, so `./ct logs > out` keeps the anonymous stream and drops the
-  # warning: precisely the plausible-looking tail misread as the whole picture.
-  # [LAW:dataflow-not-control-flow] the header is asked for, not left to a
-  # branch inside tail that counts arguments.
-  tail -v -n 40 -F "${logs[@]}"
+  tail -n 40 -F "$CT_LOG_DIR"/*.log
 }
 
 cmd_ui() {
@@ -935,15 +895,13 @@ EOF
 }
 
 # Runs first because it is the cheapest stage and nothing downstream means
-# anything if it fails. Cheapest is not free: measured at 4.0-4.1s over five
+# anything if it fails. Cheapest is not free: measured at 3.6-4.2s over five
 # runs, of which all but a fraction is two fixtures being watched for a bounded
 # interval to prove a process is STILL THERE -- an observation that cannot be
-# hurried, only skipped. Everything else here decides rather than watches, and
-# costs a tenth of a second or two: the log checks add 0.21s, measured
-# interleaved against the same stage without them, five pairs on a quiet host.
-# Take those numbers only from a quiet host -- the same pair measured 4.7s and
-# 11s while this machine was busy, which says nothing about either build.
-# Compare the minute a full run spends on stages 2 to 4.
+# hurried, only skipped. Every other check here costs around a tenth of a second,
+# which is why adding one moves the total by less than the spread between runs:
+# measured interleaved, five pairs, against the same stage without the log
+# checks. Compare the minute a full run spends on stages 2 to 4.
 #
 # Everything under it decides something before a byte leaves the host:
 # what a session is labelled, whether a daemon may launch, whether a stopped
@@ -2286,24 +2244,3 @@ cmd_verify() {
   ct_trace "./ct sql \"SELECT round(sumIf(CostUSD, ServesToolCall), 2) FROM $CT_CLICKHOUSE_DATABASE.$CT_CLICKHOUSE_REQUESTS_VIEW WHERE toYYYYMM(Timestamp) = 202603\""
 }
 
-# --- dispatch ---------------------------------------------------------------
-
-# The header block is the only copy of the command list; usage reads it back
-# rather than restating it. Ending the range at the first blank line, instead of
-# a line number, is what keeps that true when a command is added.
-usage() {
-  sed -n '3,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-}
-
-case "${1:-}" in
-  up)     cmd_up ;;
-  down)   cmd_down ;;
-  status) cmd_status ;;
-  logs)   cmd_logs ;;
-  ui)     cmd_ui ;;
-  env)    cmd_env ;;
-  verify) cmd_verify ;;
-  sql)    shift; cmd_sql "$@" ;;
-  claude) shift; cmd_claude "$@" ;;
-  *)      usage; exit 1 ;;
-esac
