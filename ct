@@ -8,7 +8,7 @@
 #   ./ct env       print the exports that make Claude Code emit spans
 #   ./ct verify    prove end to end that a Claude session reaches every sink
 #   ./ct status    what is running, and is it answering
-#   ./ct logs      tail the log of every service that has started
+#   ./ct logs      tail the log of every service that has written one
 #   ./ct ui        open the Jaeger UI
 #   ./ct down      stop the stack
 
@@ -748,7 +748,18 @@ cmd_logs() {
 
   [ "${#missing[@]}" -eq 0 ] \
     || ct_warn "no log on disk, so not followed: ${missing[*]##*/}"
-  tail -n 40 -F "${logs[@]}"
+
+  # -v, so every followed log is labelled whatever the count. Without it BSD
+  # tail prints the `==> file <==` header only when given MORE THAN ONE file,
+  # which makes the labelling an accident of how many logs happen to exist --
+  # and the one case this command exists to be honest about, a `ct up` that
+  # aborted after clickhouse, is exactly the one file case. Measured: a lone log
+  # comes out as a bare stream with nothing naming it. The caveat above rides on
+  # stderr, so `./ct logs > out` keeps the anonymous stream and drops the
+  # warning: precisely the plausible-looking tail misread as the whole picture.
+  # [LAW:dataflow-not-control-flow] the header is asked for, not left to a
+  # branch inside tail that counts arguments.
+  tail -v -n 40 -F "${logs[@]}"
 }
 
 cmd_ui() {
@@ -1030,7 +1041,7 @@ verify_config_env_guard() {
 # ct_for_each_service would pass them unchanged; one that went back to globbing
 # $CT_LOG_DIR would fail the stray row and the empty one.
 verify_service_logs() {
-  local present followed unwritten root dir file actual row=0 status complaint
+  local present followed unwritten root dir file row=0 status complaint
   local -a files
 
   root="$(mktemp -d)"
@@ -1148,6 +1159,18 @@ verify_service_logs() {
     *clickhouse.log*) ;;
     *) ct_die "ct logs did not hand clickhouse.log -- the one log on disk -- to tail.
   It passed: ${partial_argv:-(nothing at all)}" ;;
+  esac
+  # Whether a header gets printed is tail's behaviour, not this stack's; asking
+  # for one is ours, and this row is the half we own. It is asserted on the ONE
+  # log case because that is the case BSD tail labels only when told to, and the
+  # case a half-started stack produces.
+  case "$partial_argv" in
+    *-v*) ;;
+    *) ct_die "ct logs followed a single log without asking tail to name it.
+  It passed: $partial_argv
+  Unlabelled, one log reads as the whole stack to someone who does not know two
+  more are missing -- and the warning that would tell them is on stderr, which a
+  redirect drops." ;;
   esac
   case "$partial_argv" in
     *jaeger.log*|*collector.log*) ct_die "ct logs handed tail a log that is not on disk.
